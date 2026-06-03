@@ -10,7 +10,7 @@ import time
 import jwt
 import requests
 
-from .errors import InvalidAuthTokenError, ProviderNotConfiguredError
+from .errors import ApiError, InvalidAuthTokenError, ProviderNotConfiguredError
 
 APP_JWT_ISSUER = "axios-data-card-api"
 APP_JWT_AUDIENCE = "axios-data-card-client"
@@ -246,6 +246,8 @@ def exchange_privy_access_token(access_token):
     email = pick_email(user)
     wallet_address = pick_wallet_address(user)
     smart_wallet_address = pick_smart_wallet_address(user)
+    if not wallet_address and not smart_wallet_address:
+        raise ApiError("wallet_login_required", status_code=403)
     app_jwt = sign_app_jwt(
         {
             "privyUserId": verified["user_id"],

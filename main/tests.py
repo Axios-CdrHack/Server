@@ -368,6 +368,28 @@ class ApiSmokeTests(TestCase):
         headers = mock_get.call_args.kwargs["headers"]
         self.assertEqual(headers["privy-app-id"], "test-privy-app-id")
 
+    @patch("main.auth.get_privy_user")
+    @patch("main.auth.verify_privy_access_token")
+    def test_privy_exchange_requires_wallet_login(self, mock_verify, mock_user):
+        mock_verify.return_value = {
+            "user_id": "did:privy:email-only",
+            "session_id": "session-test",
+            "expiration": 9999999999,
+        }
+        mock_user.return_value = {
+            "id": "did:privy:email-only",
+            "linked_accounts": [{"type": "email", "address": "email-only@example.com"}],
+        }
+
+        response = self.client.post(
+            "/auth/privy/exchange",
+            {"privyAccessToken": "privy-access-token-for-test"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "wallet_login_required")
+
     @patch("main.auth.requests.get")
     def test_privy_access_token_uses_app_verification_key(self, mock_get):
         auth_module._PRIVY_VERIFICATION_KEY_CACHE.clear()
