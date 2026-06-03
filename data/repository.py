@@ -473,6 +473,8 @@ def get_vault_for_field(field):
 
 def field_to_dict(field):
     vault = get_vault_for_field(field)
+    requires_verification = field.kind in VERIFICATION_REQUIRED_KINDS and field.requires_verification
+    verification_status = field.verification_status if requires_verification else "not_required"
     item = {
         "id": field.id,
         "userId": field.user_id,
@@ -483,8 +485,8 @@ def field_to_dict(field):
         "accessMode": field.access_mode,
         "priceCents": field.price_cents,
         "currency": field.currency,
-        "requiresVerification": field.requires_verification,
-        "verificationStatus": field.verification_status,
+        "requiresVerification": requires_verification,
+        "verificationStatus": verification_status,
         "cdrState": field.cdr_state,
         "sellerAddress": field.seller_address,
         "createdAt": to_iso(field.created_at),
