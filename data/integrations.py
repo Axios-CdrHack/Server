@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 import uuid
 
@@ -351,6 +352,8 @@ def run_server_wallet_subprocess(script_path, front_dir, payload, timeout, failu
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
+        if detail:
+            print(f"[{failure_code}] {detail[:2000]}", file=sys.stderr)
         raise ApiError(failure_code, detail[:500] or failure_code, status_code=502)
     return completed
 
