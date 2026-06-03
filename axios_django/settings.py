@@ -31,6 +31,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
+    "users",
+    "data",
+    "onchain",
     "api",
 ]
 
