@@ -1,6 +1,10 @@
 from datetime import datetime, timezone as datetime_timezone
+from contextlib import contextmanager
+from pathlib import Path
+import fcntl
 import re
 import secrets
+import tempfile
 import threading
 
 from django.db import transaction
@@ -36,9 +40,34 @@ from main.constants import (
 )
 
 
-# SQLite allows a single writer. The dev runserver is multi-threaded, and one
-# "save" fires 5 parallel POST /fields, so writes queue in-process.
+# SQLite allows a single writer. A profile save fires parallel POST /fields,
+# and production gunicorn workers are separate processes, so writes queue
+# across both threads and processes.
 _write_lock = threading.RLock()
+_write_lock_state = threading.local()
+_sqlite_write_lock_path = Path(tempfile.gettempdir()) / "axios_cdr_hack_sqlite_write.lock"
+
+
+@contextmanager
+def write_lock():
+    with _write_lock:
+        depth = getattr(_write_lock_state, "depth", 0)
+        if depth:
+            _write_lock_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                _write_lock_state.depth = depth
+            return
+
+        with _sqlite_write_lock_path.open("w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _write_lock_state.depth = 1
+            try:
+                yield
+            finally:
+                _write_lock_state.depth = 0
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def now_iso():
@@ -399,19 +428,20 @@ def profile_to_search_document(profile):
 def refresh_search_document(user):
     profile = profile_to_dict(user)
     document = profile_to_search_document(profile)
-    AppSearchDocument.objects.update_or_create(
-        user=user,
-        defaults={
-            "age": document["age"],
-            "gender": document["gender"],
-            "country": document["country"] or DEFAULT_COUNTRY,
-            "residence": document["residence"],
-            "occupation": document["occupation"],
-            "tags": document["tags"],
-            "searchable_text": document["text"],
-            "updated_at": django_timezone.now(),
-        },
-    )
+    with write_lock():
+        AppSearchDocument.objects.update_or_create(
+            user=user,
+            defaults={
+                "age": document["age"],
+                "gender": document["gender"],
+                "country": document["country"] or DEFAULT_COUNTRY,
+                "residence": document["residence"],
+                "occupation": document["occupation"],
+                "tags": document["tags"],
+                "searchable_text": document["text"],
+                "updated_at": django_timezone.now(),
+            },
+        )
 
 
 def mask_value(kind, value):
@@ -548,7 +578,7 @@ def save_user_dict(user, has_profile=None):
 
 
 def persist_user(user):
-    with _write_lock:
+    with write_lock():
         return save_user_dict(user, has_profile=None)
 
 
@@ -585,7 +615,7 @@ def get_profile_by_slug(slug):
 
 
 def save_profile(profile):
-    with _write_lock:
+    with write_lock():
         with transaction.atomic():
             obj, _ = AppUser.objects.update_or_create(id=profile["id"], defaults=profile_defaults(profile, has_profile=True))
             replace_profile_children(obj, profile)
@@ -601,7 +631,7 @@ def upsert_profile(body):
 
 
 def save_field_dict(field):
-    with _write_lock:
+    with write_lock():
         with transaction.atomic():
             user = AppUser.objects.filter(id=field["userId"]).first()
             if not user:
@@ -735,85 +765,89 @@ def upsert_field(body):
 
 
 def mark_field_verified(field_id):
-    field = field_queryset().filter(id=field_id).first()
-    if not field:
-        return None
-    field.verification_status = "verified"
-    field.updated_at = django_timezone.now()
-    field.save(update_fields=["verification_status", "updated_at"])
-    return field_to_dict(field_queryset().get(id=field_id))
+    with write_lock():
+        field = field_queryset().filter(id=field_id).first()
+        if not field:
+            return None
+        field.verification_status = "verified"
+        field.updated_at = django_timezone.now()
+        field.save(update_fields=["verification_status", "updated_at"])
+        return field_to_dict(field_queryset().get(id=field_id))
 
 
 def save_deploy_log(field_id, cdr_vault_uuid, deploy_tx_hash):
-    field = field_queryset().filter(id=field_id).first()
-    field_dict = field_to_dict(field) if field else None
-    if not field or not field_is_deployable(field_dict):
-        return None
-    field.access_mode = "paid"
-    field.cdr_state = "on"
-    field.value_preview = mask_value(field.kind, field.value_preview)
-    field.updated_at = django_timezone.now()
-    field.save(update_fields=["access_mode", "cdr_state", "value_preview", "updated_at"])
-    next_field = {**field_dict, "accessMode": "paid", "cdrState": "on", "cdrVaultUuid": cdr_vault_uuid, "deployTxHash": deploy_tx_hash}
-    save_cdr_vault_from_field(field, next_field)
-    return field_to_dict(field_queryset().get(id=field_id))
+    with write_lock():
+        field = field_queryset().filter(id=field_id).first()
+        field_dict = field_to_dict(field) if field else None
+        if not field or not field_is_deployable(field_dict):
+            return None
+        field.access_mode = "paid"
+        field.cdr_state = "on"
+        field.value_preview = mask_value(field.kind, field.value_preview)
+        field.updated_at = django_timezone.now()
+        field.save(update_fields=["access_mode", "cdr_state", "value_preview", "updated_at"])
+        next_field = {**field_dict, "accessMode": "paid", "cdrState": "on", "cdrVaultUuid": cdr_vault_uuid, "deployTxHash": deploy_tx_hash}
+        save_cdr_vault_from_field(field, next_field)
+        return field_to_dict(field_queryset().get(id=field_id))
 
 
 def save_server_cdr_deployment(field_id, deployment):
-    field = field_queryset().filter(id=field_id).first()
-    field_dict = field_to_dict(field) if field else None
-    if not field or not field_can_start_cdr_deploy(field_dict):
-        return None
-    field.access_mode = "paid"
-    field.cdr_state = "on"
-    field.value_preview = mask_value(field.kind, field.value_preview)
-    field.updated_at = django_timezone.now()
-    field.save(update_fields=["access_mode", "cdr_state", "value_preview", "updated_at"])
-    next_field = {
-        **field_dict,
-        "accessMode": "paid",
-        "cdrState": "on",
-        "cdrVaultUuid": str(deployment["cdrVaultUuid"]),
-        "deployTxHash": deployment["deployTxHash"],
-        "cdrLicenseIpId": deployment["cdrLicenseIpId"],
-        "cdrLicenseTermsId": str(deployment["cdrLicenseTermsId"]),
-        "platformWallet": deployment.get("platformWallet"),
-        "ipaRecipient": deployment.get("recipient"),
-        "cdrOwnerAddress": deployment.get("cdrOwnerAddress"),
-        "writeConditionAddress": deployment.get("writeConditionAddress"),
-        "readConditionAddress": deployment.get("readConditionAddress"),
-        "writeConditionData": deployment.get("writeConditionData"),
-        "readConditionData": deployment.get("readConditionData"),
-        "ipaNftContract": deployment.get("ipaNftContract"),
-        "ipaTokenId": str(deployment["ipaTokenId"]) if deployment.get("ipaTokenId") is not None else None,
-        "ipRegistrationTxHash": deployment.get("ipRegistrationTxHash"),
-        "ipaTransferTxHash": deployment.get("ipaTransferTxHash"),
-        "licenseConfigTxHash": deployment.get("licenseConfigTxHash"),
-        "licenseAttachTxHash": deployment.get("licenseAttachTxHash"),
-        "cdrAllocateTxHash": deployment.get("allocateTxHash"),
-    }
-    save_cdr_vault_from_field(field, next_field)
-    return field_to_dict(field_queryset().get(id=field_id))
+    with write_lock():
+        field = field_queryset().filter(id=field_id).first()
+        field_dict = field_to_dict(field) if field else None
+        if not field or not field_can_start_cdr_deploy(field_dict):
+            return None
+        field.access_mode = "paid"
+        field.cdr_state = "on"
+        field.value_preview = mask_value(field.kind, field.value_preview)
+        field.updated_at = django_timezone.now()
+        field.save(update_fields=["access_mode", "cdr_state", "value_preview", "updated_at"])
+        next_field = {
+            **field_dict,
+            "accessMode": "paid",
+            "cdrState": "on",
+            "cdrVaultUuid": str(deployment["cdrVaultUuid"]),
+            "deployTxHash": deployment["deployTxHash"],
+            "cdrLicenseIpId": deployment["cdrLicenseIpId"],
+            "cdrLicenseTermsId": str(deployment["cdrLicenseTermsId"]),
+            "platformWallet": deployment.get("platformWallet"),
+            "ipaRecipient": deployment.get("recipient"),
+            "cdrOwnerAddress": deployment.get("cdrOwnerAddress"),
+            "writeConditionAddress": deployment.get("writeConditionAddress"),
+            "readConditionAddress": deployment.get("readConditionAddress"),
+            "writeConditionData": deployment.get("writeConditionData"),
+            "readConditionData": deployment.get("readConditionData"),
+            "ipaNftContract": deployment.get("ipaNftContract"),
+            "ipaTokenId": str(deployment["ipaTokenId"]) if deployment.get("ipaTokenId") is not None else None,
+            "ipRegistrationTxHash": deployment.get("ipRegistrationTxHash"),
+            "ipaTransferTxHash": deployment.get("ipaTransferTxHash"),
+            "licenseConfigTxHash": deployment.get("licenseConfigTxHash"),
+            "licenseAttachTxHash": deployment.get("licenseAttachTxHash"),
+            "cdrAllocateTxHash": deployment.get("allocateTxHash"),
+        }
+        save_cdr_vault_from_field(field, next_field)
+        return field_to_dict(field_queryset().get(id=field_id))
 
 
 def set_cdr_state(field_id, cdr_state):
-    field = field_queryset().filter(id=field_id).first()
-    field_dict = field_to_dict(field) if field else None
-    if not field or (cdr_state != "off" and not field_is_deployable(field_dict)):
-        return None
-    if cdr_state == "on" and not field_has_mintable_license(field_dict):
-        return None
-    field.cdr_state = cdr_state
-    if cdr_state == "on":
-        field.access_mode = "paid"
-    field.updated_at = django_timezone.now()
-    field.save(update_fields=["cdr_state", "access_mode", "updated_at"])
-    vault = get_vault_for_field(field)
-    if vault:
-        vault.status = "active" if cdr_state == "on" else "revoked"
-        vault.updated_at = django_timezone.now()
-        vault.save(update_fields=["status", "updated_at"])
-    return field_to_dict(field_queryset().get(id=field_id))
+    with write_lock():
+        field = field_queryset().filter(id=field_id).first()
+        field_dict = field_to_dict(field) if field else None
+        if not field or (cdr_state != "off" and not field_is_deployable(field_dict)):
+            return None
+        if cdr_state == "on" and not field_has_mintable_license(field_dict):
+            return None
+        field.cdr_state = cdr_state
+        if cdr_state == "on":
+            field.access_mode = "paid"
+        field.updated_at = django_timezone.now()
+        field.save(update_fields=["cdr_state", "access_mode", "updated_at"])
+        vault = get_vault_for_field(field)
+        if vault:
+            vault.status = "active" if cdr_state == "on" else "revoked"
+            vault.updated_at = django_timezone.now()
+            vault.save(update_fields=["status", "updated_at"])
+        return field_to_dict(field_queryset().get(id=field_id))
 
 
 def get_search_documents():
@@ -886,7 +920,7 @@ def quote_to_dict(quote):
 
 
 def save_quote(quote):
-    with _write_lock:
+    with write_lock():
         obj, _ = AppQuote.objects.update_or_create(
             id=quote["id"],
             defaults={
@@ -971,7 +1005,7 @@ def order_to_dict(order):
 
 
 def save_order(order):
-    with _write_lock:
+    with write_lock():
         with transaction.atomic():
             quote = AppQuote.objects.filter(id=order.get("quoteId")).first()
             obj, _ = AppOrder.objects.update_or_create(
@@ -1046,14 +1080,15 @@ def get_order(order_id):
 
 
 def update_order(order):
-    existing = AppOrder.objects.filter(id=order["id"]).first()
-    if not existing:
-        return save_order(order)
-    existing.status = order.get("status", existing.status)
-    existing.payment_tx_hash = order.get("paymentTxHash", existing.payment_tx_hash)
-    existing.updated_at = django_timezone.now()
-    existing.save(update_fields=["status", "payment_tx_hash", "updated_at"])
-    return order_to_dict(AppOrder.objects.prefetch_related("seller_payouts").get(id=existing.id))
+    with write_lock():
+        existing = AppOrder.objects.filter(id=order["id"]).first()
+        if not existing:
+            return save_order(order)
+        existing.status = order.get("status", existing.status)
+        existing.payment_tx_hash = order.get("paymentTxHash", existing.payment_tx_hash)
+        existing.updated_at = django_timezone.now()
+        existing.save(update_fields=["status", "payment_tx_hash", "updated_at"])
+        return order_to_dict(AppOrder.objects.prefetch_related("seller_payouts").get(id=existing.id))
 
 
 def list_orders_by_buyer_wallet(wallet):
@@ -1065,30 +1100,31 @@ def list_orders_by_buyer_wallet(wallet):
 
 
 def save_export_log(order_id, payload):
-    order = AppOrder.objects.filter(id=order_id).first()
-    if not order:
-        return None
-    log = AppExportLog.objects.create(
-        order=order,
-        generated_at=to_dt(payload.get("generatedAt")),
-        format=payload.get("format") or "csv",
-        successful_field_ids=payload.get("successfulFieldIds") or [],
-        failed_field_ids=payload.get("failedFieldIds") or [],
-    )
-    successful = set(payload.get("successfulFieldIds") or [])
-    failed = set(payload.get("failedFieldIds") or [])
-    for item in AppOrderItem.objects.filter(order=order):
-        if item.field_id in successful or item.field_id in failed:
-            AppExportLogItem.objects.create(export_log=log, order_item=item, success=item.field_id in successful)
-    return {
-        "id": log.id,
-        "orderId": order.id,
-        "generatedAt": to_iso(log.generated_at),
-        "format": log.format,
-        "successfulFieldIds": log.successful_field_ids,
-        "failedFieldIds": log.failed_field_ids,
-        "createdAt": to_iso(log.created_at),
-    }
+    with write_lock():
+        order = AppOrder.objects.filter(id=order_id).first()
+        if not order:
+            return None
+        log = AppExportLog.objects.create(
+            order=order,
+            generated_at=to_dt(payload.get("generatedAt")),
+            format=payload.get("format") or "csv",
+            successful_field_ids=payload.get("successfulFieldIds") or [],
+            failed_field_ids=payload.get("failedFieldIds") or [],
+        )
+        successful = set(payload.get("successfulFieldIds") or [])
+        failed = set(payload.get("failedFieldIds") or [])
+        for item in AppOrderItem.objects.filter(order=order):
+            if item.field_id in successful or item.field_id in failed:
+                AppExportLogItem.objects.create(export_log=log, order_item=item, success=item.field_id in successful)
+        return {
+            "id": log.id,
+            "orderId": order.id,
+            "generatedAt": to_iso(log.generated_at),
+            "format": log.format,
+            "successfulFieldIds": log.successful_field_ids,
+            "failedFieldIds": log.failed_field_ids,
+            "createdAt": to_iso(log.created_at),
+        }
 
 
 def get_public_card(slug):
@@ -1186,29 +1222,30 @@ def onchain_sale_to_dict(sale):
 
 
 def save_onchain_sales(sales):
-    saved = []
-    for sale in sales:
-        field = AppDataField.objects.filter(id=sale.get("fieldId")).first() if sale.get("fieldId") and sale.get("fieldId") != "0x" else None
-        order = AppOrder.objects.filter(id=sale.get("orderId")).first() if sale.get("orderId") and not str(sale.get("orderId")).startswith("0x") else None
-        obj, _ = AppOnchainSale.objects.update_or_create(
-            id=sale["id"],
-            defaults={
-                "order": order,
-                "field": field,
-                "buyer_wallet": sale.get("buyerWallet") or "",
-                "seller_address": sale.get("sellerAddress") or "",
-                "kind": sale.get("kind") or "",
-                "label": sale.get("label") or "Paid data",
-                "cdr_license_ip_id": sale.get("cdrLicenseIpId"),
-                "gross_cents": int(sale.get("grossCents") or 0),
-                "seller_cents": int(sale.get("sellerCents") or 0),
-                "service_fee_cents": int(sale.get("serviceFeeCents") or 0),
-                "payment_tx_hash": sale.get("paymentTxHash") or "",
-                "block_number": str(sale.get("blockNumber")) if sale.get("blockNumber") is not None else None,
-                "log_index": sale.get("logIndex"),
-                "source": sale.get("source") or "onchain",
-                "created_at": to_dt(sale.get("createdAt")),
-            },
-        )
-        saved.append(onchain_sale_to_dict(obj))
-    return saved
+    with write_lock():
+        saved = []
+        for sale in sales:
+            field = AppDataField.objects.filter(id=sale.get("fieldId")).first() if sale.get("fieldId") and sale.get("fieldId") != "0x" else None
+            order = AppOrder.objects.filter(id=sale.get("orderId")).first() if sale.get("orderId") and not str(sale.get("orderId")).startswith("0x") else None
+            obj, _ = AppOnchainSale.objects.update_or_create(
+                id=sale["id"],
+                defaults={
+                    "order": order,
+                    "field": field,
+                    "buyer_wallet": sale.get("buyerWallet") or "",
+                    "seller_address": sale.get("sellerAddress") or "",
+                    "kind": sale.get("kind") or "",
+                    "label": sale.get("label") or "Paid data",
+                    "cdr_license_ip_id": sale.get("cdrLicenseIpId"),
+                    "gross_cents": int(sale.get("grossCents") or 0),
+                    "seller_cents": int(sale.get("sellerCents") or 0),
+                    "service_fee_cents": int(sale.get("serviceFeeCents") or 0),
+                    "payment_tx_hash": sale.get("paymentTxHash") or "",
+                    "block_number": str(sale.get("blockNumber")) if sale.get("blockNumber") is not None else None,
+                    "log_index": sale.get("logIndex"),
+                    "source": sale.get("source") or "onchain",
+                    "created_at": to_dt(sale.get("createdAt")),
+                },
+            )
+            saved.append(onchain_sale_to_dict(obj))
+        return saved
