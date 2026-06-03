@@ -3,6 +3,7 @@ import re
 from django.views.decorators.http import require_http_methods
 
 from main.auth import verify_app_jwt
+from main.constants import DATA_FIELD_KINDS
 from main.errors import ApiError, ValidationApiError
 from main.views import (
     api_endpoint,
@@ -23,6 +24,7 @@ from data.orders import create_order, get_export_plan, summarize_order
 from data.search import build_quote, build_quote_detail, extend_quote
 
 UINT_RE = re.compile(r"^\d+$")
+DATA_FIELD_KIND_SET = set(DATA_FIELD_KINDS)
 
 
 @api_endpoint
@@ -42,7 +44,7 @@ def profile_fields(request, profile_id):
 def fields(request):
     body = parse_json(request)
     require_keys(body, ["kind", "label", "accessMode", "priceCents"])
-    if body["kind"] not in {"email", "mobile", "telegram", "discord", "twitter"}:
+    if body["kind"] not in DATA_FIELD_KIND_SET:
         raise ValidationApiError(issues=[{"path": ["kind"], "message": "Invalid field kind"}])
     profile_id = body.get("profileId") or body.get("userId")
     assert_profile_auth(request.app_auth, profile_id)
@@ -87,7 +89,7 @@ def verify_confirm(request):
 def search_quote(request):
     body = parse_json(request)
     require_keys(body, ["prompt"])
-    if body.get("wantedFields") and not set(body["wantedFields"]).issubset({"email", "mobile", "telegram", "discord", "twitter"}):
+    if body.get("wantedFields") and not set(body["wantedFields"]).issubset(DATA_FIELD_KIND_SET):
         raise ValidationApiError(issues=[{"path": ["wantedFields"], "message": "Invalid field kind"}])
     if body.get("buyerWallet"):
         buyer_wallet = validate_address(body["buyerWallet"], "buyerWallet")

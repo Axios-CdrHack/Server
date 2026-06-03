@@ -3,7 +3,7 @@ import re
 from django.http import StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 
-from main.constants import PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
+from main.constants import DATA_FIELD_KINDS, PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
 from main.errors import ApiError, ValidationApiError
 from main.views import (
     api_endpoint,
@@ -24,6 +24,7 @@ from onchain import repository
 from onchain.integrations import deploy_field_cdr_with_server_wallet, list_onchain_sales_by_wallet, upload_field_ip_metadata
 
 UINT_RE = re.compile(r"^\d+$")
+DATA_FIELD_KIND_SET = set(DATA_FIELD_KINDS)
 
 
 @api_endpoint
@@ -32,7 +33,7 @@ UINT_RE = re.compile(r"^\d+$")
 def field_ip_metadata(request):
     body = parse_json(request)
     require_keys(body, ["profileId", "kind"])
-    if body["kind"] not in {"email", "mobile", "telegram", "discord", "twitter"}:
+    if body["kind"] not in DATA_FIELD_KIND_SET:
         raise ValidationApiError(issues=[{"path": ["kind"], "message": "Invalid field kind"}])
     assert_profile_auth(request.app_auth, body["profileId"])
     metadata = upload_field_ip_metadata(body["profileId"], body["kind"], str(body.get("label") or body["kind"]))

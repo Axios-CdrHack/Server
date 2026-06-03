@@ -4,10 +4,10 @@ import os
 import requests
 
 from . import repository
-from main.constants import BATCH_SIZE, DEFAULT_WANTED_FIELDS, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS
+from main.constants import BATCH_SIZE, DATA_FIELD_KINDS, DEFAULT_WANTED_FIELDS, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS
 from main.errors import ProviderNotConfiguredError
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 
 
 def gemini_api_url():
@@ -88,7 +88,9 @@ def build_prompt(prompt):
             f"Allowed locale values: {', '.join(vocab['locales'])}",
             f"Observed occupation values: {', '.join(vocab['occupations'])}",
             f"Allowed gender values: {', '.join(vocab['genders'])}",
-            f"Paid parameter options: {', '.join(DEFAULT_WANTED_FIELDS)}",
+            f"Paid parameter options: {', '.join(DATA_FIELD_KINDS)}",
+            f"Default recommendedFields: {', '.join(DEFAULT_WANTED_FIELDS)}.",
+            "Only include LV2 fields such as insurance, height, weight, or blood_type when the user explicitly asks for them.",
             "",
             "JSON keys: minAge, maxAge, gender, country, locale, occupation, terms, recommendedFields.",
             f"User prompt: {prompt}",
@@ -144,7 +146,7 @@ def analyze_search_intent(prompt):
     if not text:
         raise GeminiIntentError("gemini_intent_empty_response")
     parsed = json.loads(text)
-    fields = [field for field in parsed.get("recommendedFields", DEFAULT_WANTED_FIELDS) if field in DEFAULT_WANTED_FIELDS]
+    fields = [field for field in parsed.get("recommendedFields", DEFAULT_WANTED_FIELDS) if field in DATA_FIELD_KINDS]
     return {"filters": normalize_filters(parsed), "recommendedFields": fields or list(DEFAULT_WANTED_FIELDS)}
 
 

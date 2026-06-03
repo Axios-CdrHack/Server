@@ -277,7 +277,7 @@ def create_auth_user_stub(email, existing=None):
 
 
 def slugify_name(name):
-    slug = re.sub(r"[^a-z0-9가-힣]+", "-", (name or "").lower()).strip("-")[:36]
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:36]
     return slug or "card"
 
 
@@ -420,6 +420,14 @@ def mask_value(kind, value):
         return value
     if kind == "mobile":
         return re.sub(r"\d(?=\d{4})", "*", value)
+    if kind == "insurance":
+        return "Insurance data"
+    if kind == "height":
+        return "*** cm"
+    if kind == "weight":
+        return "*** kg"
+    if kind == "blood_type":
+        return "**"
     if value.startswith("@"):
         return f"{value[:3]}***"
     return f"{value[:12]}..." if len(value) > 14 else f"{value[:2]}***"
@@ -640,7 +648,14 @@ def save_cdr_vault_from_field(field_model, field):
         vault = AppCdrVault(field=field_model, id=f"{field_model.id}-cdr")
     vault.network = field.get("network") or "aeneid"
     vault.cdr_vault_uuid = str(field.get("cdrVaultUuid") or vault.cdr_vault_uuid or "0")
-    vault.owner_address = field.get("ipaRecipient") or field.get("sellerAddress") or field_model.user.wallet_address
+    vault.owner_address = (
+        field.get("cdrOwnerAddress")
+        or field.get("platformWallet")
+        or vault.owner_address
+        or field.get("ipaRecipient")
+        or field.get("sellerAddress")
+        or field_model.user.wallet_address
+    )
     vault.write_condition_address = field.get("writeConditionAddress") or CDR_OWNER_WRITE_CONDITION_ADDRESS
     vault.read_condition_address = field.get("readConditionAddress") or CDR_LICENSE_READ_CONDITION_ADDRESS
     vault.write_condition_data = field.get("writeConditionData") or "0x"
@@ -763,6 +778,11 @@ def save_server_cdr_deployment(field_id, deployment):
         "cdrLicenseTermsId": str(deployment["cdrLicenseTermsId"]),
         "platformWallet": deployment.get("platformWallet"),
         "ipaRecipient": deployment.get("recipient"),
+        "cdrOwnerAddress": deployment.get("cdrOwnerAddress"),
+        "writeConditionAddress": deployment.get("writeConditionAddress"),
+        "readConditionAddress": deployment.get("readConditionAddress"),
+        "writeConditionData": deployment.get("writeConditionData"),
+        "readConditionData": deployment.get("readConditionData"),
         "ipaNftContract": deployment.get("ipaNftContract"),
         "ipaTokenId": str(deployment["ipaTokenId"]) if deployment.get("ipaTokenId") is not None else None,
         "ipRegistrationTxHash": deployment.get("ipRegistrationTxHash"),

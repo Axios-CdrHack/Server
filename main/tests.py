@@ -1,20 +1,23 @@
 import importlib
 import json
 import os
+from io import StringIO
 from unittest.mock import patch
 
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from django.apps import apps as django_apps
+from django.core.management import CommandError, call_command
 from django.db import connection
 from django.test import Client, TestCase
 
 from . import auth as auth_module
 from .auth import get_privy_user, sign_app_jwt, verify_privy_access_token
-from data.models import AppDataField, AppOrder, AppOrderItem, AppOrderSellerPayout, AppQuote
+from data import repository
+from data.models import AppDataField, AppOrder, AppOrderItem, AppOrderSellerPayout, AppQuote, AppSearchDocument
 from data.integrations import hex_with_0x
-from data.orders import build_access_aux_data
+from data.orders import build_access_aux_data, create_order, get_export_plan
 from onchain.models import AppCdrVault
 from users.models import AppCareer, AppEducation, AppUser
 
@@ -80,6 +83,32 @@ class ApiSmokeTests(TestCase):
         )["token"]
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
 
+    def tx_hash(self, seed):
+        return "0x" + seed * 64
+
+    def make_field_mintable(self, field_id, index):
+        field = AppDataField.objects.get(id=field_id)
+        field.cdr_state = "on"
+        field.save(update_fields=["cdr_state"])
+        AppCdrVault.objects.create(
+            id=f"{field_id}-cdr",
+            field=field,
+            cdr_vault_uuid=str(100 + index),
+            owner_address="0x9999999999999999999999999999999999999999",
+            write_condition_address="0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            read_condition_address="0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            write_condition_data="0x12",
+            read_condition_data="0x34",
+            deploy_tx_hash=self.tx_hash("a"),
+            cdr_license_ip_id="0x" + f"{index:040x}",
+            cdr_license_terms_id="123",
+            ipa_nft_contract="0x3333333333333333333333333333333333333333",
+            ipa_token_id=str(index),
+            license_config_tx_hash=self.tx_hash("b"),
+            status="active",
+        )
+        return field
+
     def test_public_health_profiles_and_card(self):
         self.assertEqual(self.client.get("/health").json()["ok"], True)
         profiles = self.client.get("/profiles").json()["profiles"]
@@ -126,6 +155,50 @@ class ApiSmokeTests(TestCase):
         encoded = build_access_aux_data({"licenseTokenIds": ["1", "2"]})
         self.assertTrue(encoded.startswith("0x"))
         self.assertIn("0000000000000000000000000000000000000000000000000000000000000002", encoded)
+
+    @patch("data.orders.verify_license_tokens_owned_by")
+    def test_order_accepts_batch_license_mint_tx_hash(self, mock_verify):
+        buyer = "0x4444444444444444444444444444444444444444"
+        self.make_field_mintable("user-1-email", 1)
+        self.make_field_mintable("user-1-telegram", 2)
+        AppQuote.objects.create(
+            id="quote-batch",
+            buyer_wallet=buyer,
+            prompt="pm in seoul",
+            filters={"country": "Korea", "terms": ["pm"]},
+            recommended_fields=["email", "telegram"],
+            wanted_fields=["email", "telegram"],
+            profile_ids=["user-1"],
+            matched_profile_count=1,
+        )
+        batch_tx_hash = self.tx_hash("c")
+
+        order = create_order(
+            {
+                "quoteId": "quote-batch",
+                "buyerWallet": buyer,
+                "prompt": "pm in seoul",
+                "wantedFields": ["email", "telegram"],
+                "selectedFieldIds": ["user-1-email", "user-1-telegram"],
+                "licenseTokenGrants": [
+                    {"fieldId": "user-1-email", "licenseTokenId": "101", "mintTxHash": batch_tx_hash},
+                    {"fieldId": "user-1-telegram", "licenseTokenId": "102", "mintTxHash": batch_tx_hash},
+                ],
+                "paymentTxHash": batch_tx_hash,
+            },
+            owner_wallets=[buyer],
+        )
+
+        self.assertEqual(order["paymentTxHash"], batch_tx_hash)
+        self.assertEqual(order["licenseTokenIds"], ["101", "102"])
+        self.assertEqual({grant["mintTxHash"] for grant in order["licenseTokenGrants"]}, {batch_tx_hash})
+        self.assertEqual(AppOrderItem.objects.filter(order_id=order["id"]).count(), 2)
+        mock_verify.assert_called_once_with([buyer], ["101", "102"])
+
+        export_plan = get_export_plan(order["id"])
+        aux_by_field = {item["fieldId"]: item["accessAuxData"] for item in export_plan["items"]}
+        self.assertEqual(aux_by_field["user-1-email"], build_access_aux_data({"licenseTokenIds": ["101"]}))
+        self.assertEqual(aux_by_field["user-1-telegram"], build_access_aux_data({"licenseTokenIds": ["102"]}))
 
     def test_rpc_hex_values_keep_0x_prefix(self):
         self.assertEqual(hex_with_0x("abc123"), "0xabc123")
@@ -204,6 +277,145 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(verified["app_id"], "test-privy-app-id")
         self.assertEqual(mock_get.call_args.args[0], "https://auth.privy.io/api/v1/apps/test-privy-app-id")
         self.assertEqual(mock_get.call_args.kwargs["headers"]["privy-app-id"], "test-privy-app-id")
+
+
+class BulkSearchCdrCommandTests(TestCase):
+    wallet = "0xE34CD8C9C1561A575a24bE5A5E0e883D96E28f81"
+    platform_wallet = "0x9999999999999999999999999999999999999999"
+
+    def tx_hash(self, seed):
+        return "0x" + f"{seed:064x}"
+
+    def mock_metadata(self, profile_id, kind, label):
+        return {
+            "ipMetadata": {
+                "ipMetadataURI": f"https://metadata.example/{profile_id}/{kind}.json",
+                "ipMetadataHash": self.tx_hash(9000),
+                "nftMetadataURI": f"https://metadata.example/{profile_id}/{kind}.json",
+                "nftMetadataHash": self.tx_hash(9001),
+            }
+        }
+
+    def mock_deployment(self, payload):
+        kind_index = {
+            "email": 1,
+            "mobile": 2,
+            "telegram": 3,
+            "discord": 4,
+            "twitter": 5,
+            "insurance": 6,
+            "height": 7,
+            "weight": 8,
+            "blood_type": 9,
+        }[payload["kind"]]
+        user_number = int(payload["fieldId"].split("-")[-2])
+        seed = user_number * 10 + kind_index
+        return {
+            "platformWallet": self.platform_wallet,
+            "recipient": payload["recipient"],
+            "cdrVaultUuid": str(5000 + seed),
+            "deployTxHash": self.tx_hash(seed),
+            "allocateTxHash": self.tx_hash(1000 + seed),
+            "cdrOwnerAddress": self.platform_wallet,
+            "writeConditionAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "readConditionAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "writeConditionData": "0x12",
+            "readConditionData": "0x34",
+            "cdrLicenseIpId": "0x" + f"{seed:040x}",
+            "cdrLicenseTermsId": "1894",
+            "ipaNftContract": "0xcccccccccccccccccccccccccccccccccccccccc",
+            "ipaTokenId": str(seed),
+            "ipRegistrationTxHash": self.tx_hash(2000 + seed),
+            "licenseConfigTxHash": self.tx_hash(3000 + seed),
+            "licenseAttachTxHash": self.tx_hash(3000 + seed),
+            "ipaTransferTxHash": self.tx_hash(4000 + seed),
+        }
+
+    def test_bulk_command_default_dry_run_prepares_100_profiles(self):
+        out = StringIO()
+
+        call_command("bulk_search_cdr", stdout=out)
+
+        self.assertIn("users=100", out.getvalue())
+        self.assertIn("deploy_candidates=900", out.getvalue())
+        self.assertEqual(AppUser.objects.count(), 0)
+
+    def test_bulk_command_rejects_parallel_live_deployments(self):
+        with self.assertRaisesMessage(CommandError, "--concurrency must be 1"):
+            call_command("bulk_search_cdr", "--execute", "--users", "1", "--kinds", "email", "--concurrency", "2", stdout=StringIO())
+
+    def test_bulk_profiles_use_diverse_template_combinations(self):
+        from data.management.commands.bulk_search_cdr import build_profile
+
+        profiles = [build_profile(index, "search-demo", self.wallet) for index in range(1, 101)]
+
+        self.assertGreaterEqual(len({profile["occupation"] for profile in profiles}), 20)
+        self.assertGreaterEqual(len({profile["residence"] for profile in profiles}), 15)
+        self.assertGreaterEqual(len({profile["educations"][0]["education"] for profile in profiles}), 15)
+        self.assertEqual(profiles[0]["country"], "Korea")
+        self.assertEqual(profiles[0]["occupation"], "Product Manager")
+
+    @patch("data.management.commands.bulk_search_cdr.deploy_field_cdr_with_server_wallet")
+    @patch("data.management.commands.bulk_search_cdr.upload_field_ip_metadata")
+    def test_bulk_command_creates_searchable_deployed_fields_and_skips_rerun(self, mock_upload, mock_deploy):
+        mock_upload.side_effect = self.mock_metadata
+        mock_deploy.side_effect = self.mock_deployment
+        out = StringIO()
+
+        call_command("bulk_search_cdr", "--execute", "--users", "2", "--kinds", "email,insurance,height,blood_type", "--concurrency", "1", stdout=out)
+
+        self.assertEqual(AppUser.objects.count(), 2)
+        self.assertEqual(AppSearchDocument.objects.count(), 2)
+        self.assertEqual(AppDataField.objects.count(), 8)
+        self.assertEqual(AppCdrVault.objects.count(), 8)
+        user = AppUser.objects.get(id="search-demo-001")
+        self.assertEqual(user.wallet_address, self.wallet)
+        self.assertEqual(user.smart_wallet_address, self.wallet)
+        self.assertEqual(user.payout_address, self.wallet)
+        field = AppDataField.objects.get(id="search-demo-001-email")
+        self.assertEqual(field.seller_address, self.wallet)
+        self.assertEqual(field.cdr_state, "on")
+        vault = AppCdrVault.objects.get(field=field)
+        self.assertEqual(vault.owner_address, self.platform_wallet)
+        self.assertEqual(vault.ipa_recipient, self.wallet)
+        self.assertEqual(vault.write_condition_data, "0x12")
+        self.assertEqual(vault.read_condition_data, "0x34")
+        self.assertTrue(repository.field_has_mintable_license(repository.field_to_dict(field)))
+
+        self.assertEqual(AppDataField.objects.get(id="search-demo-001-insurance").label, "Insurance Data")
+        self.assertEqual(AppDataField.objects.get(id="search-demo-001-blood_type").value_preview, "**")
+
+        call_command("bulk_search_cdr", "--execute", "--users", "2", "--kinds", "email,insurance,height,blood_type", "--concurrency", "1", stdout=StringIO())
+
+        self.assertEqual(mock_deploy.call_count, 8)
+        self.assertEqual(AppDataField.objects.count(), 8)
+
+    @patch("data.management.commands.bulk_search_cdr.deploy_field_cdr_with_server_wallet")
+    @patch("data.management.commands.bulk_search_cdr.upload_field_ip_metadata")
+    @patch("data.search.analyze_search_intent")
+    def test_bulk_command_fields_match_search_quote(self, mock_intent, mock_upload, mock_deploy):
+        mock_upload.side_effect = self.mock_metadata
+        mock_deploy.side_effect = self.mock_deployment
+        mock_intent.return_value = {
+            "filters": {"country": "Korea", "terms": ["product"]},
+            "recommendedFields": ["email", "insurance", "blood_type"],
+        }
+        call_command("bulk_search_cdr", "--execute", "--users", "2", "--kinds", "email,insurance,blood_type", "--concurrency", "1", stdout=StringIO())
+
+        response = Client(HTTP_ORIGIN="http://localhost:3000").post(
+            "/search/quote",
+            {"prompt": "korea product contacts", "wantedFields": ["email", "insurance", "blood_type"]},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["matchedProfileCount"], 1)
+        self.assertEqual(payload["paidFieldCount"], 3)
+        costs = payload["matches"][0]["fieldCosts"]
+        self.assertEqual({item["kind"] for item in costs}, {"email", "insurance", "blood_type"})
+        self.assertTrue(all(item.get("cdrLicenseIpId") for item in costs))
+        self.assertTrue(all(item.get("ipaTokenId") for item in costs))
 
 
 class LegacyStoreMigrationTests(TestCase):
