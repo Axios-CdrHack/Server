@@ -1,9 +1,9 @@
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 
-from api.auth import exchange_privy_access_token
-from api.errors import ApiError, ValidationApiError
-from api.views import (
+from main.auth import exchange_privy_access_token
+from main.errors import ApiError, ValidationApiError
+from main.views import (
     api_endpoint,
     assert_wallet_auth,
     authenticated,

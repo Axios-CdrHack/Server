@@ -22,7 +22,7 @@ def load_env_file(path):
 
 
 def main():
-    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "axios_django.settings")
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "main.settings")
     base_dir = Path(__file__).resolve().parent
     load_env_file(base_dir / ".env")
     load_env_file(base_dir.parent / ".env")

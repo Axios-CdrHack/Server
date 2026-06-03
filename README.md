@@ -1,4 +1,4 @@
-# AXIOS Django API
+# AXIOS Django Server
 
 API-compatible Django replacement for the previous Express server.
 

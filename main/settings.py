@@ -25,26 +25,26 @@ load_env_file(BASE_DIR.parent / ".env")
 SECRET_KEY = "axios-django-api-local-secret"
 DEBUG = True
 ALLOWED_HOSTS = ["*"]
-ROOT_URLCONF = "axios_django.urls"
-WSGI_APPLICATION = "axios_django.wsgi.application"
+ROOT_URLCONF = "main.urls"
+WSGI_APPLICATION = "main.wsgi.application"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
+    "main",
     "users",
     "data",
     "onchain",
-    "api",
 ]
 
 MIDDLEWARE = [
-    "api.middleware.CorsAndOriginMiddleware",
+    "main.middleware.CorsAndOriginMiddleware",
 ]
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "api.sqlite3",
+        "NAME": BASE_DIR / "main.sqlite3",
         "OPTIONS": {"timeout": 20},
     }
 }

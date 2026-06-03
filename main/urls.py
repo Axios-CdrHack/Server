@@ -1,7 +1,7 @@
 from django.urls import path, re_path
 
-from api import views as common_views
 from data import views as data_views
+from main import views as common_views
 from onchain import views as onchain_views
 from users import views as user_views
 

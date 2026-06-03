@@ -1,7 +1,7 @@
 from web3 import Web3
 
-from .constants import STORY_AENEID_LICENSE_TOKEN_ADDRESS, STORY_AENEID_RPC_URL
-from .errors import LicenseVerificationError
+from main.constants import STORY_AENEID_LICENSE_TOKEN_ADDRESS, STORY_AENEID_RPC_URL
+from main.errors import LicenseVerificationError
 
 OWNER_OF_ABI = [
     {

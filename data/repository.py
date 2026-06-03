@@ -1,4 +1,3 @@
-from copy import deepcopy
 from datetime import datetime, timezone as datetime_timezone
 import re
 import secrets
@@ -21,11 +20,10 @@ from data.models import (
 from onchain.models import AppCdrVault, AppOnchainSale
 from users.models import AppCareer, AppEducation, AppUser
 
-from api.constants import (
+from main.constants import (
     BATCH_SIZE,
     CDR_LICENSE_READ_CONDITION_ADDRESS,
     CDR_OWNER_WRITE_CONDITION_ADDRESS,
-    DATA_FIELD_KINDS,
     DEFAULT_CAREER_STATUS,
     DEFAULT_COUNTRY,
     DEFAULT_EDUCATION_STATUS,
@@ -35,7 +33,6 @@ from api.constants import (
     SELLER_SHARE_BPS,
     VERIFICATION_REQUIRED_KINDS,
 )
-from api.seed_data import build_seed
 
 
 # SQLite allows a single writer. The dev runserver is multi-threaded, and one
@@ -475,18 +472,6 @@ def field_to_dict(field):
     return strip_none(item)
 
 
-def field_with_alias(field):
-    if isinstance(field, AppDataField):
-        return field_to_dict(field)
-    item = deepcopy(field)
-    item["profileId"] = item.get("userId")
-    return strip_none(item)
-
-
-def is_paid_cdr_field(field):
-    return field.get("accessMode") == "paid" and field.get("cdrState") == "on"
-
-
 def field_is_deployable(field):
     return bool(field.get("cdrLicenseIpId") and field.get("cdrLicenseTermsId")) and (
         not field.get("requiresVerification") or field.get("verificationStatus") == "verified"
@@ -520,32 +505,15 @@ def profile_queryset():
     return AppUser.objects.filter(has_profile=True).prefetch_related("educations", "careers")
 
 
-@transaction.atomic
-def ensure_seeded():
-    if AppUser.objects.filter(has_profile=True).exists():
-        return
-    users, profiles, fields = build_seed()
-    for profile in profiles:
-        save_profile(profile)
-    for user in users:
-        if not AppUser.objects.filter(id=user["id"]).exists():
-            save_user_dict(user, has_profile=False)
-    for field in fields:
-        save_field_dict(field)
-
-
 def list_profiles():
-    ensure_seeded()
     return [profile_to_dict(user) for user in profile_queryset().order_by("id")]
 
 
 def list_users():
-    ensure_seeded()
     return [user_to_dict(user) for user in AppUser.objects.order_by("id")]
 
 
 def get_user(user_id):
-    ensure_seeded()
     user = AppUser.objects.filter(id=user_id).first()
     return user_to_dict(user) if user else None
 
@@ -598,13 +566,11 @@ def connect_wallet_to_user(email, wallet_address):
 
 
 def get_profile(profile_id):
-    ensure_seeded()
     user = profile_queryset().filter(id=profile_id).first()
     return profile_to_dict(user) if user else None
 
 
 def get_profile_by_slug(slug):
-    ensure_seeded()
     user = profile_queryset().filter(public_slug=slug).first()
     return profile_to_dict(user) if user else None
 
@@ -620,7 +586,6 @@ def save_profile(profile):
 
 
 def upsert_profile(body):
-    ensure_seeded()
     existing = get_profile(body.get("id")) if body.get("id") else None
     profile = profile_from_input(body, existing)
     return save_profile(profile)
@@ -699,7 +664,6 @@ def save_cdr_vault_from_field(field_model, field):
 
 
 def upsert_field(body):
-    ensure_seeded()
     timestamp = now_iso()
     owner_id = body.get("userId") or body.get("profileId") or ""
     existing_model = None
@@ -832,7 +796,6 @@ def set_cdr_state(field_id, cdr_state):
 
 
 def get_search_documents():
-    ensure_seeded()
     profile_count = AppUser.objects.filter(has_profile=True).count()
     if profile_count and AppSearchDocument.objects.count() < profile_count:
         for user in profile_queryset():
@@ -858,18 +821,15 @@ def get_search_documents():
 
 
 def get_fields_by_profile_ids(profile_ids):
-    ensure_seeded()
     wanted = set(profile_ids)
     return [field_to_dict(field) for field in field_queryset().filter(user_id__in=wanted).order_by("id")]
 
 
 def get_fields_by_profile_id(profile_id):
-    ensure_seeded()
     return [field_to_dict(field) for field in field_queryset().filter(user_id=profile_id).order_by("id")]
 
 
 def get_fields_by_ids(field_ids):
-    ensure_seeded()
     wanted = list(dict.fromkeys(field_ids))
     fields = {field.id: field_to_dict(field) for field in field_queryset().filter(id__in=wanted)}
     return [fields[field_id] for field_id in wanted if field_id in fields]
@@ -936,7 +896,6 @@ def save_quote(quote):
 
 
 def get_quote(quote_id):
-    ensure_seeded()
     quote = AppQuote.objects.filter(id=quote_id).first()
     return quote_to_dict(quote) if quote else None
 
@@ -1061,7 +1020,6 @@ def save_order(order):
 
 
 def get_order(order_id):
-    ensure_seeded()
     order = AppOrder.objects.prefetch_related("seller_payouts").filter(id=order_id).first()
     return order_to_dict(order) if order else None
 
@@ -1215,10 +1173,3 @@ def save_onchain_sales(sales):
         )
         saved.append(onchain_sale_to_dict(obj))
     return saved
-
-
-def list_cached_onchain_sales_by_wallet(wallet):
-    return [
-        onchain_sale_to_dict(sale)
-        for sale in AppOnchainSale.objects.select_related("field").filter(seller_address__iexact=wallet.lower()).order_by("-created_at")
-    ]

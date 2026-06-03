@@ -1,10 +1,9 @@
+import json
+
+from django.db import connection as default_connection
 from django.db import migrations
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-
-
-def camel(source, key, default=None):
-    return source.get(key, default) if isinstance(source, dict) else default
 
 
 def as_dt(value):
@@ -21,12 +20,32 @@ def scoped_child_id(user_id, local_id, fallback):
     return local if str(local).startswith(f"{user_id}-") else f"{user_id}-{local}"
 
 
-def store_map(StoreRecord, namespace):
-    return {row.key: row.value for row in StoreRecord.objects.filter(namespace=namespace)}
+def legacy_table_exists(connection):
+    return "api_storerecord" in connection.introspection.table_names()
 
 
-def store_values(StoreRecord, namespace):
-    return [row.value for row in StoreRecord.objects.filter(namespace=namespace)]
+def decode_value(value):
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    return json.loads(value)
+
+
+def store_rows(connection, namespace):
+    if not legacy_table_exists(connection):
+        return []
+    with connection.cursor() as cursor:
+        cursor.execute("select key, value from api_storerecord where namespace = %s", [namespace])
+        return [(key, decode_value(value)) for key, value in cursor.fetchall()]
+
+
+def store_map(connection, namespace):
+    return {key: value for key, value in store_rows(connection, namespace)}
+
+
+def store_values(connection, namespace):
+    return [value for _key, value in store_rows(connection, namespace)]
 
 
 def public_fields_for(profile):
@@ -85,8 +104,10 @@ def create_search_document(AppSearchDocument, user, profile):
     )
 
 
-def migrate_store_records(apps, _schema_editor):
-    StoreRecord = apps.get_model("api", "StoreRecord")
+def migrate_store_records(apps, schema_editor):
+    connection = schema_editor.connection if schema_editor else default_connection
+    if not legacy_table_exists(connection):
+        return
     AppUser = apps.get_model("users", "AppUser")
     AppEducation = apps.get_model("users", "AppEducation")
     AppCareer = apps.get_model("users", "AppCareer")
@@ -99,8 +120,8 @@ def migrate_store_records(apps, _schema_editor):
     AppCdrVault = apps.get_model("onchain", "AppCdrVault")
     AppOnchainSale = apps.get_model("onchain", "AppOnchainSale")
 
-    users_by_id = store_map(StoreRecord, "users")
-    profiles_by_id = store_map(StoreRecord, "profiles")
+    users_by_id = store_map(connection, "users")
+    profiles_by_id = store_map(connection, "profiles")
     merged_user_ids = sorted(set(users_by_id) | set(profiles_by_id))
 
     for user_id in merged_user_ids:
@@ -160,7 +181,7 @@ def migrate_store_records(apps, _schema_editor):
             )
         create_search_document(AppSearchDocument, user, source)
 
-    for source in store_values(StoreRecord, "data_fields"):
+    for source in store_values(connection, "data_fields"):
         user_id = source.get("userId") or source.get("profileId")
         if not user_id:
             continue
@@ -222,7 +243,7 @@ def migrate_store_records(apps, _schema_editor):
                 },
             )
 
-    for source in store_values(StoreRecord, "quotes"):
+    for source in store_values(connection, "quotes"):
         AppQuote.objects.update_or_create(
             id=source.get("id"),
             defaults={
@@ -250,7 +271,7 @@ def migrate_store_records(apps, _schema_editor):
             },
         )
 
-    for source in store_values(StoreRecord, "orders"):
+    for source in store_values(connection, "orders"):
         quote = AppQuote.objects.filter(id=source.get("quoteId")).first()
         order, _ = AppOrder.objects.update_or_create(
             id=source.get("id"),
@@ -315,7 +336,7 @@ def migrate_store_records(apps, _schema_editor):
                 created_at=as_dt(source.get("createdAt")),
             )
 
-    for source in store_values(StoreRecord, "onchain_sales"):
+    for source in store_values(connection, "onchain_sales"):
         field = AppDataField.objects.filter(id=source.get("fieldId")).first()
         order = AppOrder.objects.filter(id=source.get("orderId")).first()
         AppOnchainSale.objects.update_or_create(
@@ -343,7 +364,6 @@ def migrate_store_records(apps, _schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("api", "0002_rename_store_namespace_index"),
         ("users", "0001_initial"),
         ("data", "0001_initial"),
         ("onchain", "0001_initial"),
@@ -352,4 +372,3 @@ class Migration(migrations.Migration):
     operations = [
         migrations.RunPython(migrate_store_records, migrations.RunPython.noop),
     ]
-

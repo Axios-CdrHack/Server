@@ -2,9 +2,9 @@ from eth_abi import encode
 from web3 import Web3
 
 from . import repository
-from api.constants import BATCH_SIZE, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS, PURCHASE_CONTRACT_ADDRESS, SELLER_SHARE_BPS
-from api.errors import ApiError
-from api.license_verification import verify_license_tokens_owned_by
+from main.constants import BATCH_SIZE, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS, PURCHASE_CONTRACT_ADDRESS, SELLER_SHARE_BPS
+from main.errors import ApiError
+from onchain.license_verification import verify_license_tokens_owned_by
 from .search import find_matching_profile_ids
 
 TX_HASH_RE = r"^0x[a-fA-F0-9]{64}$"

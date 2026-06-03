@@ -2,9 +2,9 @@ import re
 
 from django.views.decorators.http import require_http_methods
 
-from api.auth import verify_app_jwt
-from api.errors import ApiError, ValidationApiError
-from api.views import (
+from main.auth import verify_app_jwt
+from main.errors import ApiError, ValidationApiError
+from main.views import (
     api_endpoint,
     assert_field_auth,
     assert_profile_auth,
@@ -201,4 +201,3 @@ def public_card(_request, slug):
     if not card:
         return json_ok({"error": "public_card_not_found"}, status=404)
     return json_ok({"profile": card})
-

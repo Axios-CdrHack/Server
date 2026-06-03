@@ -3,9 +3,9 @@ import re
 from django.http import StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 
-from api.constants import PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
-from api.errors import ApiError, ValidationApiError
-from api.views import (
+from main.constants import PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
+from main.errors import ApiError, ValidationApiError
+from main.views import (
     api_endpoint,
     api_error_payload,
     assert_field_auth,

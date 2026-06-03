@@ -19,8 +19,8 @@ from web3 import Web3
 
 from data.models import AppVerification
 
-from api.constants import MAX_PROFILE_IMAGE_BYTES, PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
-from api.errors import ApiError, ProviderNotConfiguredError
+from main.constants import MAX_PROFILE_IMAGE_BYTES, PURCHASE_CONTRACT_ADDRESS, STORY_AENEID_RPC_URL
+from main.errors import ApiError, ProviderNotConfiguredError
 
 SUPPORTED_MIME_TYPES = {
     "image/jpeg": ".jpg",

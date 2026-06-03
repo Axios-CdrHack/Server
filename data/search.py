@@ -4,8 +4,8 @@ import os
 import requests
 
 from . import repository
-from api.constants import BATCH_SIZE, DEFAULT_WANTED_FIELDS, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS
-from api.errors import ProviderNotConfiguredError
+from main.constants import BATCH_SIZE, DEFAULT_WANTED_FIELDS, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS
+from main.errors import ProviderNotConfiguredError
 
 GEMINI_MODEL = "gemini-2.5-flash"
 

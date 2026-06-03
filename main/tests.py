@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 from unittest.mock import patch
 
@@ -6,11 +7,11 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from django.apps import apps as django_apps
+from django.db import connection
 from django.test import Client, TestCase
 
 from . import auth as auth_module
 from .auth import get_privy_user, sign_app_jwt, verify_privy_access_token
-from .models import StoreRecord
 from data.models import AppDataField, AppOrder, AppOrderItem, AppOrderSellerPayout, AppQuote
 from data.integrations import hex_with_0x
 from data.orders import build_access_aux_data
@@ -22,6 +23,50 @@ class ApiSmokeTests(TestCase):
     def setUp(self):
         os.environ["PRIVY_APP_SECRET"] = "test-secret"
         self.client = Client(HTTP_ORIGIN="http://localhost:3000")
+        self.create_profiles()
+
+    def create_profiles(self):
+        profiles = [
+            ("user-1", "Jaine", "jaine-k7q3p9", "jane.pm@example.com", "0x1111111111111111111111111111111111111111", "female", 30, "Korea", "Seoul", "IT Product Manager"),
+            ("user-2", "Platform Operator", "platform-operator-9d2hvk", "ops.tpm@example.com", "0x2222222222222222222222222222222222222222", "nonbinary", 31, "Singapore", "Singapore", "Technical Program Manager"),
+            ("user-3", "Fintech Maker", "fintech-maker-v3r8n2", "fintech.pm@example.com", "0x3333333333333333333333333333333333333333", "male", 29, "United States", "New York", "Product Manager"),
+            ("user-4", "Growth PM", "growth-pm-h8t4kc", "growth.pm@example.com", "0x5555555555555555555555555555555555555555", "female", 32, "Germany", "Berlin", "Growth Product Lead"),
+            ("user-5", "Enterprise Seller", "sales-lead-z2n6qa", "sales.manager@example.com", "0x4444444444444444444444444444444444444444", "male", 34, "United States", "San Francisco", "Sales Manager"),
+        ]
+        for user_id, name, slug, email, wallet, gender, age, country, residence, occupation in profiles:
+            user = AppUser.objects.create(
+                id=user_id,
+                email=email,
+                wallet_address=wallet,
+                payout_address=wallet,
+                name=name,
+                age=age,
+                occupation=occupation,
+                gender=gender,
+                country=country,
+                residence=residence,
+                display_name=name,
+                public_slug=slug,
+                has_profile=True,
+            )
+            AppEducation.objects.create(id=f"{user_id}-education-1", user=user, education="Yonsei University", status="graduated")
+            AppCareer.objects.create(id=f"{user_id}-career-1", user=user, career=occupation, start_date="2020-01", end_date="", status="employed")
+            if user_id == "user-1":
+                for kind, price in {"email": 900, "mobile": 1400, "telegram": 450, "discord": 350, "twitter": 300}.items():
+                    AppDataField.objects.create(
+                        id=f"{user_id}-{kind}",
+                        user=user,
+                        kind=kind,
+                        label="Mobile" if kind == "mobile" else kind[:1].upper() + kind[1:],
+                        value_preview=email if kind == "email" else f"@{name.lower().replace(' ', '')}",
+                        access_mode="paid",
+                        price_cents=price,
+                        currency="IP",
+                        requires_verification=kind == "mobile",
+                        verification_status="verified" if kind == "mobile" else "not_required",
+                        cdr_state="off",
+                        seller_address=wallet,
+                    )
 
     def auth_headers(self):
         token = sign_app_jwt(
@@ -111,7 +156,7 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(mock_post.call_args.kwargs["data"]["From"], "+15550000000")
         self.assertIn("Your AXIOS verification code is", mock_post.call_args.kwargs["data"]["Body"])
 
-    @patch("api.auth.requests.get")
+    @patch("main.auth.requests.get")
     def test_privy_user_lookup_sends_app_id_header(self, mock_get):
         os.environ["PRIVY_APP_ID"] = "test-privy-app-id"
         os.environ["PRIVY_APP_SECRET"] = "test-privy-secret"
@@ -123,7 +168,7 @@ class ApiSmokeTests(TestCase):
         headers = mock_get.call_args.kwargs["headers"]
         self.assertEqual(headers["privy-app-id"], "test-privy-app-id")
 
-    @patch("api.auth.requests.get")
+    @patch("main.auth.requests.get")
     def test_privy_access_token_uses_app_verification_key(self, mock_get):
         auth_module._PRIVY_VERIFICATION_KEY_CACHE.clear()
         os.environ["PRIVY_APP_ID"] = "test-privy-app-id"
@@ -161,12 +206,33 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(mock_get.call_args.kwargs["headers"]["privy-app-id"], "test-privy-app-id")
 
 
-class StoreRecordMigrationTests(TestCase):
-    def test_store_records_migrate_into_domain_tables(self):
-        StoreRecord.objects.create(
-            namespace="users",
-            key="user-x",
-            value={
+class LegacyStoreMigrationTests(TestCase):
+    def insert_store_record(self, namespace, key, value):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "insert into api_storerecord (namespace, key, value, updated_at) values (%s, %s, %s, %s)",
+                [namespace, key, json.dumps(value), "2026-05-21 00:00:00"],
+            )
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                create table api_storerecord (
+                    id integer primary key autoincrement,
+                    namespace varchar(64) not null,
+                    key varchar(160) not null,
+                    value text not null,
+                    updated_at datetime not null
+                )
+                """
+            )
+
+    def test_legacy_store_rows_migrate_into_domain_tables(self):
+        self.insert_store_record(
+            "users",
+            "user-x",
+            {
                 "id": "user-x",
                 "email": "owner@example.com",
                 "walletAddress": "0x1111111111111111111111111111111111111111",
@@ -176,10 +242,10 @@ class StoreRecordMigrationTests(TestCase):
                 "updatedAt": "2026-05-21T00:00:00.000Z",
             },
         )
-        StoreRecord.objects.create(
-            namespace="profiles",
-            key="user-x",
-            value={
+        self.insert_store_record(
+            "profiles",
+            "user-x",
+            {
                 "id": "user-x",
                 "email": "owner@example.com",
                 "walletAddress": "0x1111111111111111111111111111111111111111",
@@ -198,10 +264,10 @@ class StoreRecordMigrationTests(TestCase):
                 "updatedAt": "2026-05-21T00:00:00.000Z",
             },
         )
-        StoreRecord.objects.create(
-            namespace="data_fields",
-            key="field-x",
-            value={
+        self.insert_store_record(
+            "data_fields",
+            "field-x",
+            {
                 "id": "field-x",
                 "userId": "user-x",
                 "kind": "email",
@@ -225,10 +291,10 @@ class StoreRecordMigrationTests(TestCase):
                 "updatedAt": "2026-05-21T00:00:00.000Z",
             },
         )
-        StoreRecord.objects.create(
-            namespace="quotes",
-            key="quote-x",
-            value={
+        self.insert_store_record(
+            "quotes",
+            "quote-x",
+            {
                 "id": "quote-x",
                 "buyerWallet": "0x4444444444444444444444444444444444444444",
                 "prompt": "pm in seoul",
@@ -239,10 +305,10 @@ class StoreRecordMigrationTests(TestCase):
                 "createdAt": "2026-05-21T00:00:00.000Z",
             },
         )
-        StoreRecord.objects.create(
-            namespace="orders",
-            key="order-x",
-            value={
+        self.insert_store_record(
+            "orders",
+            "order-x",
+            {
                 "id": "order-x",
                 "quoteId": "quote-x",
                 "buyerWallet": "0x4444444444444444444444444444444444444444",
