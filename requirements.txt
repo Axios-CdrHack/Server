@@ -1,4 +1,5 @@
 Django>=4.2,<5
+gunicorn>=22
 requests>=2.31
 PyJWT[crypto]>=2.8
 cryptography>=42
