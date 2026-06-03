@@ -1,6 +1,6 @@
 # AXIOS Django Server
 
-AXIOS Django server는 프론트엔드의 사용자 프로필, 공개 검색, CDR 배포, 데이터 액세스 주문을 처리하는 API 서버다. Django는 인증, 검증, DB 저장, 서버 지갑 서브프로세스 실행을 담당하고, Story Protocol과 CDR SDK의 실제 on-chain write는 `front/scripts/*.mjs` Node 스크립트가 수행한다.
+The AXIOS Django server is the API layer for user profiles, public search, CDR deployment, and paid data-access orders. Django handles authentication, validation, database persistence, and server-wallet subprocess orchestration. Actual on-chain writes for Story Protocol and the CDR SDK are delegated to the Node scripts in `front/scripts/*.mjs`.
 
 ## Quick Start
 
@@ -17,11 +17,11 @@ The frontend API client uses `http://localhost:8001`.
 ## Runtime Entry
 
 - `manage.py`: Django command runner.
-- `main/settings.py`: `.env`와 루트 `.env`를 읽고 SQLite DB를 설정한다.
-- `main/urls.py`: 전체 API route를 연결한다.
-- `main/views.py`: 공통 JSON 응답, 인증 데코레이터, 검증 helper, CDR API proxy를 제공한다.
-- `main/auth.py`: Privy session을 앱 JWT로 교환하고 앱 JWT를 검증한다.
-- `main/errors.py`: API 에러 타입을 정의한다.
+- `main/settings.py`: loads `django_server/.env` and the repository root `.env`, then configures the SQLite database.
+- `main/urls.py`: wires the full API route table.
+- `main/views.py`: provides shared JSON responses, auth decorators, validation helpers, and the CDR API proxy.
+- `main/auth.py`: exchanges Privy sessions for app JWTs and verifies app JWTs.
+- `main/errors.py`: defines typed API errors.
 
 ## App Layout
 
