@@ -17,7 +17,7 @@ from .auth import get_privy_user, sign_app_jwt, verify_privy_access_token
 from data import repository
 from data.models import AppDataField, AppOrder, AppOrderItem, AppOrderSellerPayout, AppQuote, AppSearchDocument
 from data.integrations import hex_with_0x
-from data.orders import build_access_aux_data, create_order, get_export_plan
+from data.orders import build_access_aux_data, build_order_payment_intent, create_order, get_export_plan
 from onchain.models import AppCdrVault
 from users.models import AppCareer, AppEducation, AppUser
 
@@ -199,6 +199,133 @@ class ApiSmokeTests(TestCase):
         aux_by_field = {item["fieldId"]: item["accessAuxData"] for item in export_plan["items"]}
         self.assertEqual(aux_by_field["user-1-email"], build_access_aux_data({"licenseTokenIds": ["101"]}))
         self.assertEqual(aux_by_field["user-1-telegram"], build_access_aux_data({"licenseTokenIds": ["102"]}))
+
+    @patch("data.orders.verify_license_tokens_owned_by")
+    @patch("data.orders.verify_server_ip_payment")
+    @patch("data.orders.mint_license_tokens_with_server_wallet")
+    def test_order_mints_license_tokens_with_server_wallet_when_grants_missing(self, mock_server_mint, mock_payment, mock_verify):
+        buyer = "0x4444444444444444444444444444444444444444"
+        payment_tx_hash = self.tx_hash("9")
+        self.make_field_mintable("user-1-email", 1)
+        self.make_field_mintable("user-1-telegram", 2)
+        AppQuote.objects.create(
+            id="quote-server-mint",
+            buyer_wallet=buyer,
+            prompt="pm in seoul",
+            filters={"country": "Korea", "terms": ["pm"]},
+            recommended_fields=["email", "telegram"],
+            wanted_fields=["email", "telegram"],
+            profile_ids=["user-1"],
+            matched_profile_count=1,
+        )
+        mock_server_mint.return_value = {
+            "serverWallet": "0x9999999999999999999999999999999999999999",
+            "buyerWallet": buyer,
+            "transferFromServer": True,
+            "grants": [
+                {"fieldId": "user-1-email", "licenseTokenId": "701", "mintTxHash": self.tx_hash("e")},
+                {"fieldId": "user-1-telegram", "licenseTokenId": "702", "mintTxHash": self.tx_hash("f")},
+            ],
+        }
+
+        order = create_order(
+            {
+                "quoteId": "quote-server-mint",
+                "buyerWallet": buyer,
+                "prompt": "pm in seoul",
+                "wantedFields": ["email", "telegram"],
+                "selectedFieldIds": ["user-1-email", "user-1-telegram"],
+                "paymentTxHash": payment_tx_hash,
+            },
+            owner_wallets=[buyer],
+        )
+
+        self.assertEqual(order["licenseTokenIds"], ["701", "702"])
+        self.assertEqual(order["paymentTxHash"], payment_tx_hash)
+        self.assertEqual(AppOrderItem.objects.filter(order_id=order["id"]).count(), 2)
+        mock_payment.assert_called_once_with(buyer, payment_tx_hash, 13_500_000_000_000_000_000)
+        mock_server_mint.assert_called_once()
+        payload = mock_server_mint.call_args.args[0]
+        self.assertEqual(payload["buyerWallet"], buyer)
+        self.assertTrue(payload["transferFromServer"])
+        self.assertEqual([field["fieldId"] for field in payload["fields"]], ["user-1-email", "user-1-telegram"])
+        self.assertEqual(payload["fields"][0]["licenseTermsId"], "123")
+        mock_verify.assert_called_once_with([buyer], ["701", "702"])
+
+    @patch("data.orders.server_wallet_address")
+    def test_order_payment_intent_returns_server_wallet_and_exact_amount(self, mock_server_wallet):
+        buyer = "0x4444444444444444444444444444444444444444"
+        mock_server_wallet.return_value = "0x9999999999999999999999999999999999999999"
+        self.make_field_mintable("user-1-email", 1)
+        self.make_field_mintable("user-1-telegram", 2)
+        AppQuote.objects.create(
+            id="quote-payment",
+            buyer_wallet=buyer,
+            prompt="pm in seoul",
+            filters={"country": "Korea", "terms": ["pm"]},
+            recommended_fields=["email", "telegram"],
+            wanted_fields=["email", "telegram"],
+            profile_ids=["user-1"],
+            matched_profile_count=1,
+        )
+
+        intent = build_order_payment_intent(
+            {
+                "quoteId": "quote-payment",
+                "buyerWallet": buyer,
+                "prompt": "pm in seoul",
+                "wantedFields": ["email", "telegram"],
+                "selectedFieldIds": ["user-1-email", "user-1-telegram"],
+            }
+        )
+
+        self.assertEqual(intent["recipientWallet"], "0x9999999999999999999999999999999999999999")
+        self.assertEqual(intent["amountCents"], 1350)
+        self.assertEqual(intent["amountWei"], "13500000000000000000")
+        self.assertEqual(intent["selectedFieldIds"], ["user-1-email", "user-1-telegram"])
+
+    @patch("onchain.views.list_onchain_sales_by_wallet")
+    @patch("data.orders.verify_license_tokens_owned_by")
+    def test_sales_history_includes_field_sales_for_seller_wallet_aliases(self, mock_verify, mock_onchain_sales):
+        mock_onchain_sales.return_value = []
+        buyer = "0x4444444444444444444444444444444444444444"
+        seller_wallet = "0x1111111111111111111111111111111111111111"
+        seller_payout = "0x7777777777777777777777777777777777777777"
+        AppUser.objects.filter(id="user-1").update(payout_address=seller_payout)
+        AppDataField.objects.filter(user_id="user-1").update(seller_address=seller_payout)
+        self.make_field_mintable("user-1-email", 1)
+        AppQuote.objects.create(
+            id="quote-sale",
+            buyer_wallet=buyer,
+            prompt="pm in seoul",
+            filters={"country": "Korea", "terms": ["pm"]},
+            recommended_fields=["email"],
+            wanted_fields=["email"],
+            profile_ids=["user-1"],
+            matched_profile_count=1,
+        )
+        create_order(
+            {
+                "quoteId": "quote-sale",
+                "buyerWallet": buyer,
+                "prompt": "pm in seoul",
+                "wantedFields": ["email"],
+                "selectedFieldIds": ["user-1-email"],
+                "licenseTokenGrants": [{"fieldId": "user-1-email", "licenseTokenId": "501", "mintTxHash": self.tx_hash("c")}],
+                "paymentTxHash": self.tx_hash("c"),
+            },
+            owner_wallets=[buyer],
+        )
+
+        response = self.client.get(f"/sales?wallet={seller_wallet}", **self.auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        sales = response.json()["sales"]
+        self.assertEqual(len(sales), 1)
+        self.assertEqual(sales[0]["fieldId"], "user-1-email")
+        self.assertEqual(sales[0]["source"], "server")
+        self.assertEqual(sales[0]["buyerWallet"], buyer)
+        mock_verify.assert_called_once_with([buyer], ["501"])
 
     def test_rpc_hex_values_keep_0x_prefix(self):
         self.assertEqual(hex_with_0x("abc123"), "0xabc123")

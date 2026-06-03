@@ -1,13 +1,17 @@
+import re
+
 from eth_abi import encode
 from web3 import Web3
 
 from . import repository
-from main.constants import BATCH_SIZE, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS, PURCHASE_CONTRACT_ADDRESS, SELLER_SHARE_BPS
+from .integrations import mint_license_tokens_with_server_wallet, server_wallet_address
+from main.constants import BATCH_SIZE, MAX_PAID_FIELDS_PER_ORDER, PLATFORM_FEE_BPS, PURCHASE_CONTRACT_ADDRESS, SELLER_SHARE_BPS, STORY_AENEID_RPC_URL
 from main.errors import ApiError
 from onchain.license_verification import verify_license_tokens_owned_by
 from .search import find_matching_profile_ids
 
 TX_HASH_RE = r"^0x[a-fA-F0-9]{64}$"
+WEI_PER_MINOR_UNIT = 10_000_000_000_000_000
 
 
 def normalize_license_token_ids(token_ids):
@@ -55,10 +59,42 @@ def build_seller_payouts(field_ids):
 def validate_license_grant(grant):
     if not str(grant.get("licenseTokenId", "")).isdigit():
         raise ApiError("invalid_license_token_id", status_code=400)
-    import re
 
     if not re.fullmatch(TX_HASH_RE, str(grant.get("mintTxHash", ""))):
         raise ApiError("invalid_license_mint_tx_hash", status_code=400)
+
+
+def validate_tx_hash(tx_hash, key="paymentTxHash"):
+    if not re.fullmatch(TX_HASH_RE, str(tx_hash or "")):
+        raise ApiError(f"invalid_{key}", status_code=400)
+    return tx_hash
+
+
+def minor_units_to_wei(minor_units):
+    return int(minor_units) * WEI_PER_MINOR_UNIT
+
+
+def license_mint_payload(buyer_wallet, fields):
+    return {
+        "buyerWallet": buyer_wallet,
+        "transferFromServer": True,
+        "fields": [
+            {
+                "fieldId": field["id"],
+                "licensorIpId": field.get("cdrLicenseIpId"),
+                "licenseTermsId": field.get("cdrLicenseTermsId"),
+            }
+            for field in fields
+        ],
+    }
+
+
+def mint_license_grants_for_order(buyer_wallet, fields):
+    response = mint_license_tokens_with_server_wallet(license_mint_payload(buyer_wallet, fields))
+    grants = response.get("grants") if isinstance(response, dict) else None
+    if not isinstance(grants, list):
+        raise ApiError("server_license_mint_invalid_response", status_code=502)
+    return grants
 
 
 def build_candidates(profile_ids, selected_refs=None):
@@ -108,8 +144,7 @@ def fields_for_exact_selection(field_ids, profile_ids, wanted_fields):
     return fields
 
 
-def create_order(input_data, owner_wallets=None):
-    order_id = f"order-{repository.nanoid(10)}"
+def resolve_order_selection(input_data):
     selected_field_ids_input = normalize_selected_field_ids(input_data.get("selectedFieldIds")) if "selectedFieldIds" in input_data else None
     stored_quote = repository.get_quote(input_data.get("quoteId")) if input_data.get("quoteId") else None
     if selected_field_ids_input and (not stored_quote or stored_quote.get("prompt") != input_data["prompt"]):
@@ -138,8 +173,74 @@ def create_order(input_data, owner_wallets=None):
     selected_field_ids = [field["id"] for field in fields]
     if not selected_field_ids:
         raise ApiError("no_purchasable_fields", status_code=500)
+    subtotal = sum(field["priceCents"] for field in fields)
+    service_fee = round(subtotal * PLATFORM_FEE_BPS / 10000)
+    eligible_profiles = {field["userId"] for field in fields}
+    selected_profiles = [item for item in build_candidates(profile_ids) if item["profileId"] in eligible_profiles]
+    return {
+        "filters": filters,
+        "profileIds": profile_ids,
+        "quoteId": quote_id,
+        "wantedFields": wanted_fields,
+        "fields": fields,
+        "selectedFieldIds": selected_field_ids,
+        "selectedProfiles": selected_profiles,
+        "subtotalCents": subtotal,
+        "serviceFeeCents": service_fee,
+        "totalCents": subtotal + service_fee,
+    }
 
-    grants = input_data.get("licenseTokenGrants") or []
+
+def build_order_payment_intent(input_data):
+    selection = resolve_order_selection(input_data)
+    amount_cents = selection["totalCents"]
+    return {
+        "recipientWallet": server_wallet_address(),
+        "amountCents": amount_cents,
+        "amountWei": str(minor_units_to_wei(amount_cents)),
+        "currency": "IP",
+        "selectedFieldIds": selection["selectedFieldIds"],
+        "fieldCount": len(selection["selectedFieldIds"]),
+    }
+
+
+def verify_server_ip_payment(buyer_wallet, payment_tx_hash, amount_wei):
+    tx_hash = validate_tx_hash(payment_tx_hash)
+    recipient = Web3.to_checksum_address(server_wallet_address())
+    buyer = Web3.to_checksum_address(buyer_wallet)
+    web3 = Web3(Web3.HTTPProvider(STORY_AENEID_RPC_URL, request_kwargs={"timeout": 15}))
+    try:
+        receipt = web3.eth.get_transaction_receipt(tx_hash)
+        tx = web3.eth.get_transaction(tx_hash)
+    except Exception as exc:
+        raise ApiError("payment_tx_unverifiable", status_code=402) from exc
+    if not receipt or receipt.get("status") != 1:
+        raise ApiError("payment_tx_not_successful", status_code=402)
+    if Web3.to_checksum_address(tx.get("from")) != buyer:
+        raise ApiError("payment_tx_wrong_sender", status_code=402)
+    if not tx.get("to") or Web3.to_checksum_address(tx.get("to")) != recipient:
+        raise ApiError("payment_tx_wrong_recipient", status_code=402)
+    if int(tx.get("value") or 0) < int(amount_wei):
+        raise ApiError("payment_tx_amount_insufficient", status_code=402)
+    return {"paymentTxHash": tx_hash, "recipientWallet": recipient, "amountWei": str(tx.get("value"))}
+
+
+def create_order(input_data, owner_wallets=None):
+    order_id = f"order-{repository.nanoid(10)}"
+    selection = resolve_order_selection(input_data)
+    filters = selection["filters"]
+    profile_ids = selection["profileIds"]
+    quote_id = selection["quoteId"]
+    wanted_fields = selection["wantedFields"]
+    fields = selection["fields"]
+    selected_field_ids = selection["selectedFieldIds"]
+    subtotal = selection["subtotalCents"]
+    service_fee = selection["serviceFeeCents"]
+
+    grants = input_data.get("licenseTokenGrants")
+    if not grants:
+        verify_server_ip_payment(input_data["buyerWallet"], input_data.get("paymentTxHash"), minor_units_to_wei(subtotal + service_fee))
+        grants = mint_license_grants_for_order(input_data["buyerWallet"], fields)
     for grant in grants:
         validate_license_grant(grant)
     grant_by_field = {grant["fieldId"]: grant for grant in grants}
@@ -151,10 +252,7 @@ def create_order(input_data, owner_wallets=None):
     license_token_ids = [grant["licenseTokenId"] for grant in ordered_grants]
     verify_license_tokens_owned_by(owner_wallets or [input_data["buyerWallet"]], license_token_ids)
 
-    eligible_profiles = {field["userId"] for field in fields}
-    selected_profiles = [item for item in build_candidates(profile_ids) if item["profileId"] in eligible_profiles]
-    subtotal = sum(field["priceCents"] for field in fields)
-    service_fee = round(subtotal * PLATFORM_FEE_BPS / 10000)
+    selected_profiles = selection["selectedProfiles"]
     timestamp = repository.now_iso()
     order = {
         "id": order_id,

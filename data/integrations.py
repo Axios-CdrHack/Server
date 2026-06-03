@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -9,6 +10,7 @@ import os
 import re
 import secrets
 import subprocess
+import tempfile
 import uuid
 
 from eth_account import Account
@@ -42,6 +44,17 @@ def required(name, provider):
     if not value:
         raise ProviderNotConfiguredError(message=f"{provider}_provider_not_configured")
     return value
+
+
+def story_platform_private_key():
+    private_key = required("STORY_PLATFORM_PRIVATE_KEY", "story")
+    if not re.fullmatch(r"0x[a-fA-F0-9]{64}", private_key):
+        raise ProviderNotConfiguredError(message="story_platform_private_key_invalid")
+    return private_key
+
+
+def server_wallet_address():
+    return Account.from_key(story_platform_private_key()).address
 
 
 def create_code():
@@ -307,28 +320,59 @@ def deploy_field_cdr_with_server_wallet(payload):
         raise ProviderNotConfiguredError(message="server_cdr_deploy_script_missing")
 
     try:
-        completed = subprocess.run(
-            ["node", str(script_path)],
-            cwd=front_dir,
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
-            timeout=240,
-            check=False,
-        )
+        completed = run_server_wallet_subprocess(script_path, front_dir, payload, 240, "server_cdr_deploy_failed")
     except subprocess.TimeoutExpired as exc:
         raise ApiError("server_cdr_deploy_timeout", status_code=504) from exc
     except OSError as exc:
         raise ProviderNotConfiguredError(message="node_runtime_not_configured") from exc
 
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
-        raise ApiError("server_cdr_deploy_failed", detail[:500] or "server_cdr_deploy_failed", status_code=502)
-
     try:
         return json.loads(completed.stdout)
     except ValueError as exc:
         raise ApiError("server_cdr_deploy_invalid_response", status_code=502) from exc
+
+
+def run_server_wallet_subprocess(script_path, front_dir, payload, timeout, failure_code):
+    lock_path = Path(tempfile.gettempdir()) / "axios_server_wallet_story.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            completed = subprocess.run(
+                ["node", str(script_path)],
+                cwd=front_dir,
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise ApiError(failure_code, detail[:500] or failure_code, status_code=502)
+    return completed
+
+
+def mint_license_tokens_with_server_wallet(payload):
+    base_dir = Path(__file__).resolve().parents[2]
+    front_dir = base_dir / "front"
+    script_path = front_dir / "scripts" / "server_mint_license_tokens.mjs"
+    if not script_path.exists():
+        raise ProviderNotConfiguredError(message="server_license_mint_script_missing")
+
+    try:
+        completed = run_server_wallet_subprocess(script_path, front_dir, payload, 300, "server_license_mint_failed")
+    except subprocess.TimeoutExpired as exc:
+        raise ApiError("server_license_mint_timeout", status_code=504) from exc
+    except OSError as exc:
+        raise ProviderNotConfiguredError(message="node_runtime_not_configured") from exc
+
+    try:
+        return json.loads(completed.stdout)
+    except ValueError as exc:
+        raise ApiError("server_license_mint_invalid_response", status_code=502) from exc
 
 
 def create_wallet_link_proof(email, user_id, wallet_address):

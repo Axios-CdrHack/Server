@@ -20,7 +20,7 @@ from main.views import (
 )
 from data import repository
 from data.integrations import confirm_verification, start_verification
-from data.orders import create_order, get_export_plan, summarize_order
+from data.orders import build_order_payment_intent, create_order, get_export_plan, summarize_order
 from data.search import build_quote, build_quote_detail, extend_quote
 
 UINT_RE = re.compile(r"^\d+$")
@@ -160,13 +160,24 @@ def create_order_view(request):
             "order": order,
             "payment": {
                 "contract": order["purchaseContract"],
-                "buyerPaysGas": True,
+                "buyerPaysGas": False,
                 "platformFeeBps": order["platformFeeBps"],
                 "sellerPayouts": order["sellerPayouts"],
             },
         },
         status=201,
     )
+
+
+@api_endpoint
+@authenticated
+@require_http_methods(["POST"])
+def order_payment_intent(request):
+    body = parse_json(request)
+    require_keys(body, ["buyerWallet", "prompt", "wantedFields"])
+    buyer_wallet = validate_address(body["buyerWallet"], "buyerWallet")
+    assert_wallet_auth(request.app_auth, buyer_wallet)
+    return json_ok({"payment": build_order_payment_intent(body)})
 
 
 @api_endpoint

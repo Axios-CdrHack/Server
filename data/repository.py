@@ -4,6 +4,7 @@ import secrets
 import threading
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone as django_timezone
 from django.utils.dateparse import parse_datetime
 
@@ -1117,12 +1118,30 @@ def get_public_card(slug):
     }
 
 
+def sales_wallet_scope(wallet):
+    normalized = (wallet or "").lower()
+    aliases = {normalized}
+    user_filter = Q(wallet_address__iexact=normalized) | Q(smart_wallet_address__iexact=normalized) | Q(payout_address__iexact=normalized)
+    users = list(AppUser.objects.filter(user_filter))
+    for user in users:
+        for value in [user.wallet_address, user.smart_wallet_address, user.payout_address]:
+            if value:
+                aliases.add(value.lower())
+    return aliases, [user.id for user in users]
+
+
 def list_sales_by_wallet(wallet):
-    normalized = wallet.lower()
+    aliases, user_ids = sales_wallet_scope(wallet)
+    item_filter = Q(pk__isnull=True)
+    for alias in aliases:
+        item_filter |= Q(seller_address__iexact=alias)
+    if user_ids:
+        item_filter |= Q(seller_user_id__in=user_ids)
+
     sales = []
-    items = AppOrderItem.objects.select_related("order", "field").filter(seller_address__iexact=normalized).order_by("-created_at")
+    items = AppOrderItem.objects.select_related("order", "field", "seller_user").filter(item_filter).distinct().order_by("-created_at")
     for item in items:
-        field = field_to_dict(field_queryset().get(id=item.field_id))
+        field = field_to_dict(item.field)
         service_fee = round(item.price_cents * PLATFORM_FEE_BPS / 10000)
         sales.append(
             {

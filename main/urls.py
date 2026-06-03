@@ -27,6 +27,7 @@ urlpatterns = [
     path("search/requests", data_views.search_requests),
     path("search/requests/<str:quote_id>/extend", data_views.search_request_extend),
     path("search/requests/<str:quote_id>", data_views.search_request_detail),
+    path("orders/payment-intent", data_views.order_payment_intent),
     path("orders", data_views.orders),
     path("orders/<str:order_id>/export-plan", data_views.export_plan),
     path("orders/<str:order_id>/export-log", data_views.export_log),
