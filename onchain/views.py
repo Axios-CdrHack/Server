@@ -124,12 +124,12 @@ def cdr_server_deploy_events(request):
             yield sse_message("status", {"status": "deploying", "message": "Server minting IPA + CDR"})
             deployment = deploy_field_cdr_with_server_wallet(payload)
 
-            yield sse_message("status", {"status": "saving", "message": "Saving deployment"})
             saved = repository.save_server_cdr_deployment(field["id"], deployment)
             if not saved:
                 yield sse_message("error", {"error": "field_not_deployable"})
                 return
 
+            yield sse_message("status", {"status": "saving", "message": "Saving deployment"})
             yield sse_message("complete", {"status": "complete", "field": saved, "deployment": deployment})
         except Exception as error:
             yield sse_message("error", api_error_payload(error))

@@ -129,6 +129,56 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["field"]["cdrState"], "off")
 
+    @patch("onchain.views.sse_message")
+    @patch("onchain.views.deploy_field_cdr_with_server_wallet")
+    @patch("onchain.views.upload_field_ip_metadata")
+    def test_cdr_event_stream_saves_deployment_before_saving_event(self, mock_upload, mock_deploy, mock_sse):
+        mock_upload.return_value = {
+            "ipMetadata": {
+                "ipMetadataURI": "https://metadata.example/user-1/email.json",
+                "ipMetadataHash": self.tx_hash("1"),
+                "nftMetadataURI": "https://metadata.example/user-1/email.json",
+                "nftMetadataHash": self.tx_hash("2"),
+            }
+        }
+        mock_deploy.return_value = {
+            "platformWallet": "0x9999999999999999999999999999999999999999",
+            "recipient": "0x1111111111111111111111111111111111111111",
+            "cdrVaultUuid": "42",
+            "deployTxHash": self.tx_hash("a"),
+            "allocateTxHash": self.tx_hash("b"),
+            "cdrOwnerAddress": "0x9999999999999999999999999999999999999999",
+            "writeConditionAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "readConditionAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "writeConditionData": "0x12",
+            "readConditionData": "0x34",
+            "cdrLicenseIpId": "0x2222222222222222222222222222222222222222",
+            "cdrLicenseTermsId": "123",
+            "ipaNftContract": "0x3333333333333333333333333333333333333333",
+            "ipaTokenId": "7",
+            "ipRegistrationTxHash": self.tx_hash("c"),
+            "licenseConfigTxHash": self.tx_hash("d"),
+            "licenseAttachTxHash": self.tx_hash("d"),
+            "ipaTransferTxHash": self.tx_hash("e"),
+        }
+
+        def fake_sse_message(event, payload):
+            if event == "status" and payload.get("status") == "saving":
+                raise RuntimeError("client disconnected")
+            return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+        mock_sse.side_effect = fake_sse_message
+
+        response = self.client.get("/cdr/server-deploy/events?fieldId=user-1-email", **self.auth_headers())
+        self.assertEqual(response.status_code, 200)
+        b"".join(response.streaming_content)
+
+        field = AppDataField.objects.get(id="user-1-email")
+        vault = AppCdrVault.objects.get(field=field)
+        self.assertEqual(field.cdr_state, "on")
+        self.assertEqual(vault.cdr_vault_uuid, "42")
+        self.assertEqual(vault.ipa_transfer_tx_hash, self.tx_hash("e"))
+
     def test_owner_can_upsert_profile(self):
         response = self.client.post(
             "/profiles",
