@@ -1,0 +1,7 @@
+Django>=4.2,<5
+requests>=2.31
+PyJWT[crypto]>=2.8
+cryptography>=42
+web3>=7
+eth-account>=0.13
+eth-abi>=5
