@@ -1,4 +1,4 @@
-Django>=4.2,<5
+Django>=5.2.8,<6
 gunicorn>=22
 requests>=2.31
 PyJWT[crypto]>=2.8
