@@ -31,6 +31,21 @@ class AppUser(models.Model):
         ]
 
 
+class WalletAuthChallenge(models.Model):
+    nonce = models.CharField(max_length=64, primary_key=True)
+    wallet_address = models.CharField(max_length=64, blank=True, default="")
+    chain_id = models.PositiveBigIntegerField(default=0)
+    domain = models.CharField(max_length=255, blank=True, default="")
+    uri = models.TextField(blank=True, default="")
+    message = models.TextField(blank=True, default="")
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "wallet_auth_challenges"
+
+
 class AppEducation(models.Model):
     id = models.CharField(max_length=120, primary_key=True)
     user = models.ForeignKey(AppUser, related_name="educations", on_delete=models.CASCADE)
@@ -63,4 +78,3 @@ class AppCareer(models.Model):
         indexes = [
             models.Index(fields=["user", "sort_order"], name="app_career_user_sort_idx"),
         ]
-

@@ -92,22 +92,12 @@ def wallet_matches_auth(auth, wallet):
 def profile_matches_auth(auth, profile):
     if not profile:
         return False
-    auth_privy_id = auth.get("privyUserId") or auth.get("sub")
-    if auth_privy_id and profile.get("privyUserId") == auth_privy_id:
-        return True
-    if auth.get("email") and profile.get("email", "").lower() == auth["email"]:
-        return True
     return any(wallet_matches_auth(auth, profile.get(key)) for key in ["walletAddress", "smartWalletAddress", "payoutAddress"])
 
 
 def profile_match_score(auth, profile):
     if not profile:
         return 0
-    auth_privy_id = auth.get("privyUserId") or auth.get("sub")
-    if auth_privy_id and profile.get("privyUserId") == auth_privy_id:
-        return 4
-    if auth.get("email") and profile.get("email", "").lower() == auth["email"]:
-        return 3
     if wallet_matches_auth(auth, profile.get("smartWalletAddress")):
         return 2
     if wallet_matches_auth(auth, profile.get("walletAddress")) or wallet_matches_auth(auth, profile.get("payoutAddress")):
@@ -219,4 +209,3 @@ def cdr_api_proxy(request, path):
     response = HttpResponse(upstream.content, status=upstream.status_code, content_type=upstream.headers.get("content-type", "application/json"))
     response["Cache-Control"] = "no-store"
     return response
-

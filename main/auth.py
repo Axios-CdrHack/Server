@@ -1,23 +1,34 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
 import json
 import os
 import re
+import secrets
+import string
 import time
+from urllib.parse import urlparse
 
+from django.db import transaction
+from django.utils import timezone as django_timezone
+from eth_account import Account
+from eth_account.messages import encode_defunct
 import jwt
-import requests
+from web3 import Web3
+
+from users.models import WalletAuthChallenge
 
 from .errors import ApiError, InvalidAuthTokenError, ProviderNotConfiguredError
+
 
 APP_JWT_ISSUER = "axios-data-card-api"
 APP_JWT_AUDIENCE = "axios-data-card-client"
 APP_JWT_TTL_SECONDS = 60 * 60
-PRIVY_AUTH_API_BASE_URL = "https://auth.privy.io"
-PRIVY_CLIENT_HEADER = "django:local"
-_PRIVY_VERIFICATION_KEY_CACHE = {}
+SIWE_CHAIN_ID = 1315
+SIWE_CHALLENGE_TTL_SECONDS = 5 * 60
+SIWE_STATEMENT = "Sign in to AXIOS with your wallet."
+SIWE_NONCE_RE = re.compile(r"(?:^|\n)Nonce: ([A-Za-z0-9]{8,64})(?:\n|$)")
 
 
 def read_required_env(name):
@@ -27,141 +38,58 @@ def read_required_env(name):
     return value
 
 
-def privy_api_base_url():
-    return os.environ.get("PRIVY_API_BASE_URL", "https://api.privy.io").rstrip("/")
-
-
-def normalize_pem_public_key(value):
-    if not isinstance(value, str):
-        raise ProviderNotConfiguredError(message="privy_verification_key_missing")
-
-    key = value.strip()
-    begin = "-----BEGIN PUBLIC KEY-----"
-    end = "-----END PUBLIC KEY-----"
-    if not key.startswith(begin) or not key.endswith(end):
-        raise ProviderNotConfiguredError(message="privy_verification_key_invalid")
-
-    body = key[len(begin) : -len(end)]
-    body = "".join(body.split())
-    if not body:
-        raise ProviderNotConfiguredError(message="privy_verification_key_invalid")
-    lines = [body[index : index + 64] for index in range(0, len(body), 64)]
-    return f"{begin}\n" + "\n".join(lines) + f"\n{end}\n"
-
-
-def get_privy_verification_key(app_id):
-    cached = _PRIVY_VERIFICATION_KEY_CACHE.get(app_id)
-    if cached:
-        return cached
-
-    try:
-        response = requests.get(
-            f"{PRIVY_AUTH_API_BASE_URL}/api/v1/apps/{app_id}",
-            headers={"Accept": "application/json", "privy-app-id": app_id, "privy-client": PRIVY_CLIENT_HEADER},
-            timeout=15,
-        )
-    except requests.RequestException as exc:
-        raise ProviderNotConfiguredError(message="privy_app_config_unavailable") from exc
-    if response.status_code >= 400:
-        raise ProviderNotConfiguredError(message="privy_app_config_unavailable")
-
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise ProviderNotConfiguredError(message="privy_app_config_invalid") from exc
-    verification_key = normalize_pem_public_key(body.get("verification_key"))
-    _PRIVY_VERIFICATION_KEY_CACHE[app_id] = verification_key
-    return verification_key
+def app_auth_secret():
+    secret = read_required_env("APP_AUTH_SECRET")
+    if len(secret) < 32:
+        raise ProviderNotConfiguredError(message="app_auth_secret_too_short")
+    return secret
 
 
 def base64url(data):
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def normalize_email(value):
-    if not isinstance(value, str):
-        return None
-    email = value.strip().lower()
-    return email if "@" in email else None
-
-
 def normalize_address(value):
     if not isinstance(value, str):
         return None
     value = value.strip()
-    return value if re.fullmatch(r"0x[a-fA-F0-9]{40}", value) else None
+    return Web3.to_checksum_address(value) if re.fullmatch(r"0x[a-fA-F0-9]{40}", value) else None
 
 
-def account_email(account):
-    if not isinstance(account, dict):
+def normalize_siwe_origin(value):
+    if not isinstance(value, str):
         return None
-    if account.get("type") == "email":
-        return normalize_email(account.get("address"))
-    return normalize_email(account.get("email"))
-
-
-def account_address(account):
-    if not isinstance(account, dict):
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    return normalize_address(account.get("address"))
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def pick_email(user):
-    for account in user.get("linked_accounts", []) or []:
-        email = account_email(account)
-        if email:
-            return email
-    return None
-
-
-def pick_wallet_address(user):
-    accounts = user.get("linked_accounts", []) or []
-    embedded = next(
-        (
-            account
-            for account in accounts
-            if isinstance(account, dict)
-            and account.get("type") == "wallet"
-            and account.get("chain_type") == "ethereum"
-            and account.get("wallet_client") == "privy"
-        ),
-        None,
-    )
-    any_eth = next(
-        (
-            account
-            for account in accounts
-            if isinstance(account, dict) and account.get("type") == "wallet" and account.get("chain_type") == "ethereum"
-        ),
-        None,
-    )
-    return account_address(embedded) or account_address(any_eth)
-
-
-def pick_smart_wallet_address(user):
-    accounts = user.get("linked_accounts", []) or []
-    smart_wallet = next((account for account in accounts if isinstance(account, dict) and account.get("type") == "smart_wallet"), None)
-    return account_address(smart_wallet)
+def utc_iso(value):
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def sign_app_jwt(input_data):
+    wallet_address = normalize_address(input_data.get("walletAddress"))
+    if not wallet_address:
+        raise InvalidAuthTokenError()
+
     now = int(time.time())
     exp = min(int(input_data["expiresAtSeconds"]), now + APP_JWT_TTL_SECONDS)
+    chain_id = int(input_data.get("chainId") or SIWE_CHAIN_ID)
     payload = {
-        "sub": input_data["privyUserId"],
+        "sub": input_data.get("subject") or f"eip155:{chain_id}:{wallet_address.lower()}",
         "sid": input_data["sessionId"],
-        "email": input_data.get("email"),
-        "walletAddress": input_data.get("walletAddress"),
-        "smartWalletAddress": input_data.get("smartWalletAddress"),
+        "walletAddress": wallet_address,
+        "chainId": chain_id,
         "iss": APP_JWT_ISSUER,
         "aud": APP_JWT_AUDIENCE,
         "iat": now,
         "exp": exp,
     }
-    payload = {key: value for key, value in payload.items() if value is not None}
     header = {"alg": "HS256", "typ": "JWT"}
     unsigned = f"{base64url(json.dumps(header, separators=(',', ':')).encode())}.{base64url(json.dumps(payload, separators=(',', ':')).encode())}"
-    signature = hmac.new(read_required_env("PRIVY_APP_SECRET").encode(), unsigned.encode(), hashlib.sha256).digest()
+    signature = hmac.new(app_auth_secret().encode(), unsigned.encode(), hashlib.sha256).digest()
     token = f"{unsigned}.{base64url(signature)}"
     return {
         "token": token,
@@ -174,23 +102,30 @@ def verify_app_jwt(token):
     try:
         payload = jwt.decode(
             token,
-            read_required_env("PRIVY_APP_SECRET"),
+            app_auth_secret(),
             algorithms=["HS256"],
             issuer=APP_JWT_ISSUER,
             audience=APP_JWT_AUDIENCE,
+            options={"require": ["sub", "sid", "walletAddress", "chainId", "iat", "exp"]},
         )
+    except ProviderNotConfiguredError:
+        raise
     except Exception as exc:
         raise InvalidAuthTokenError() from exc
 
-    if not isinstance(payload.get("sub"), str) or not isinstance(payload.get("sid"), str):
+    wallet_address = normalize_address(payload.get("walletAddress"))
+    if (
+        not isinstance(payload.get("sub"), str)
+        or not isinstance(payload.get("sid"), str)
+        or not wallet_address
+        or payload.get("chainId") != SIWE_CHAIN_ID
+    ):
         raise InvalidAuthTokenError()
     return {
         "sub": payload["sub"],
-        "privyUserId": payload["sub"],
         "sid": payload["sid"],
-        "email": normalize_email(payload.get("email")),
-        "walletAddress": normalize_address(payload.get("walletAddress")),
-        "smartWalletAddress": normalize_address(payload.get("smartWalletAddress")),
+        "walletAddress": wallet_address,
+        "chainId": SIWE_CHAIN_ID,
         "iss": APP_JWT_ISSUER,
         "aud": APP_JWT_AUDIENCE,
         "iat": payload.get("iat"),
@@ -198,73 +133,122 @@ def verify_app_jwt(token):
     }
 
 
-def verify_privy_access_token(access_token):
-    app_id = read_required_env("PRIVY_APP_ID")
-    try:
-        verification_key = get_privy_verification_key(app_id)
-        payload = jwt.decode(
-            access_token,
-            verification_key,
-            algorithms=["ES256"],
-            issuer="privy.io",
-            audience=app_id,
-            options={"require": ["sub", "sid", "iat", "exp"]},
-        )
-    except ProviderNotConfiguredError:
-        raise
-    except Exception as exc:
-        raise InvalidAuthTokenError() from exc
-    return {
-        "app_id": payload.get("aud"),
-        "issuer": payload.get("iss"),
-        "issued_at": payload.get("iat"),
-        "expiration": payload.get("exp"),
-        "session_id": payload.get("sid"),
-        "user_id": payload.get("sub"),
-    }
+def create_siwe_nonce():
+    now = django_timezone.now()
+    WalletAuthChallenge.objects.filter(expires_at__lt=now).delete()
+    alphabet = string.ascii_letters + string.digits
+    while True:
+        nonce = "".join(secrets.choice(alphabet) for _ in range(24))
+        if not WalletAuthChallenge.objects.filter(nonce=nonce).exists():
+            WalletAuthChallenge.objects.create(
+                nonce=nonce,
+                expires_at=now + timedelta(seconds=SIWE_CHALLENGE_TTL_SECONDS),
+            )
+            return nonce
 
 
-def get_privy_user(user_id):
-    app_id = read_required_env("PRIVY_APP_ID")
+def create_siwe_message(*, nonce, address, chain_id, origin):
+    wallet_address = normalize_address(address)
+    normalized_origin = normalize_siwe_origin(origin)
     try:
-        response = requests.get(
-            f"{privy_api_base_url()}/v1/users/{user_id}",
-            auth=(app_id, read_required_env("PRIVY_APP_SECRET")),
-            headers={"Accept": "application/json", "privy-app-id": app_id, "privy-client": PRIVY_CLIENT_HEADER},
-            timeout=15,
+        normalized_chain_id = int(chain_id)
+    except (TypeError, ValueError) as exc:
+        raise ApiError("siwe_chain_invalid", status_code=400) from exc
+    if not wallet_address:
+        raise ApiError("siwe_address_invalid", status_code=400)
+    if normalized_chain_id != SIWE_CHAIN_ID:
+        raise ApiError("siwe_chain_not_supported", status_code=400)
+    if not normalized_origin:
+        raise ApiError("siwe_origin_invalid", status_code=400)
+
+    now = django_timezone.now()
+    with transaction.atomic():
+        try:
+            challenge = WalletAuthChallenge.objects.select_for_update().get(nonce=nonce)
+        except WalletAuthChallenge.DoesNotExist as exc:
+            raise ApiError("siwe_nonce_invalid", status_code=401) from exc
+        if challenge.consumed_at:
+            raise ApiError("siwe_nonce_used", status_code=401)
+        if challenge.expires_at <= now:
+            raise ApiError("siwe_nonce_expired", status_code=401)
+
+        domain = urlparse(normalized_origin).netloc
+        if challenge.message:
+            if (
+                challenge.wallet_address.lower() != wallet_address.lower()
+                or challenge.chain_id != normalized_chain_id
+                or challenge.uri != normalized_origin
+            ):
+                raise ApiError("siwe_nonce_already_prepared", status_code=409)
+            return challenge.message
+
+        message = (
+            f"{domain} wants you to sign in with your Ethereum account:\n"
+            f"{wallet_address}\n\n"
+            f"{SIWE_STATEMENT}\n\n"
+            f"URI: {normalized_origin}\n"
+            "Version: 1\n"
+            f"Chain ID: {normalized_chain_id}\n"
+            f"Nonce: {challenge.nonce}\n"
+            f"Issued At: {utc_iso(now)}\n"
+            f"Expiration Time: {utc_iso(challenge.expires_at)}"
         )
-    except requests.RequestException as exc:
-        raise ProviderNotConfiguredError(message="privy_user_lookup_unavailable") from exc
-    if response.status_code >= 400:
+        challenge.wallet_address = wallet_address
+        challenge.chain_id = normalized_chain_id
+        challenge.domain = domain
+        challenge.uri = normalized_origin
+        challenge.message = message
+        challenge.save(update_fields=["wallet_address", "chain_id", "domain", "uri", "message"])
+        return message
+
+
+def exchange_siwe_signature(*, message, signature):
+    if not isinstance(message, str) or not isinstance(signature, str) or len(message) > 4096 or len(signature) > 1024:
         raise InvalidAuthTokenError()
-    return response.json()
+    nonce_match = SIWE_NONCE_RE.search(message)
+    if not nonce_match:
+        raise InvalidAuthTokenError()
 
+    now = django_timezone.now()
+    with transaction.atomic():
+        try:
+            challenge = WalletAuthChallenge.objects.select_for_update().get(nonce=nonce_match.group(1))
+        except WalletAuthChallenge.DoesNotExist as exc:
+            raise InvalidAuthTokenError() from exc
+        if challenge.consumed_at or challenge.expires_at <= now or not challenge.message:
+            raise InvalidAuthTokenError()
+        if not hmac.compare_digest(challenge.message, message):
+            raise InvalidAuthTokenError()
 
-def exchange_privy_access_token(access_token):
-    verified = verify_privy_access_token(access_token)
-    user = get_privy_user(verified["user_id"])
-    email = pick_email(user)
-    wallet_address = pick_wallet_address(user)
-    smart_wallet_address = pick_smart_wallet_address(user)
-    if not wallet_address and not smart_wallet_address:
-        raise ApiError("wallet_login_required", status_code=403)
-    app_jwt = sign_app_jwt(
-        {
-            "privyUserId": verified["user_id"],
-            "sessionId": verified["session_id"],
-            "expiresAtSeconds": verified["expiration"],
-            "email": email,
-            "walletAddress": wallet_address,
-            "smartWalletAddress": smart_wallet_address,
-        }
-    )
-    result = {
+        try:
+            recovered_address = Account.recover_message(encode_defunct(text=message), signature=signature)
+        except Exception as exc:
+            raise InvalidAuthTokenError() from exc
+        if recovered_address.lower() != challenge.wallet_address.lower():
+            raise InvalidAuthTokenError()
+
+        consumed = WalletAuthChallenge.objects.filter(
+            nonce=challenge.nonce,
+            consumed_at__isnull=True,
+            expires_at__gt=now,
+        ).update(consumed_at=now)
+        if consumed != 1:
+            raise InvalidAuthTokenError()
+        session_id = secrets.token_urlsafe(24)
+        app_jwt = sign_app_jwt(
+            {
+                "sessionId": session_id,
+                "expiresAtSeconds": int(time.time()) + APP_JWT_TTL_SECONDS,
+                "walletAddress": challenge.wallet_address,
+                "chainId": challenge.chain_id,
+            }
+        )
+
+    return {
         "token": app_jwt["token"],
         "expiresAt": app_jwt["expiresAt"],
-        "privyUserId": verified["user_id"],
-        "sessionId": verified["session_id"],
-        "email": email,
-        "walletAddress": wallet_address,
-        "smartWalletAddress": smart_wallet_address,
+        "subject": app_jwt["payload"]["sub"],
+        "sessionId": session_id,
+        "walletAddress": challenge.wallet_address,
+        "chainId": challenge.chain_id,
     }
-    return {key: value for key, value in result.items() if value is not None}

@@ -1,8 +1,9 @@
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 
-from main.auth import exchange_privy_access_token
+from main.auth import create_siwe_message, create_siwe_nonce, exchange_siwe_signature
 from main.errors import ApiError, ValidationApiError
+from main.middleware import request_origin
 from main.views import (
     api_endpoint,
     assert_wallet_auth,
@@ -20,21 +21,31 @@ from users.integrations import create_wallet_link_proof, upload_profile_image
 
 
 @api_endpoint
+@require_http_methods(["GET"])
+def siwe_nonce(_request):
+    return json_ok({"nonce": create_siwe_nonce()})
+
+
+@api_endpoint
 @require_http_methods(["POST"])
-def privy_exchange(request):
+def siwe_message(request):
     body = parse_json(request)
-    token = body.get("privyAccessToken")
-    if not isinstance(token, str) or len(token) < 20:
-        raise ValidationApiError(issues=[{"path": ["privyAccessToken"], "message": "Required"}])
-    session = exchange_privy_access_token(token)
-    user = repository.upsert_user_by_email(session["email"]) if session.get("email") else None
-    if session.get("email") and session.get("walletAddress"):
-        connected = repository.connect_wallet_to_user(session["email"], session["walletAddress"])
-        if connected == "wallet_conflict":
-            return json_ok({"error": "wallet_already_connected", "message": "This wallet is already linked to another email."}, status=409)
-        if connected == "wallet_locked":
-            return json_ok({"error": "wallet_link_locked", "message": "This email account already has an immutable linked wallet."}, status=409)
-        user = connected
+    origin = request_origin(request)
+    message = create_siwe_message(
+        nonce=body.get("nonce"),
+        address=body.get("address"),
+        chain_id=body.get("chainId"),
+        origin=origin,
+    )
+    return json_ok({"message": message})
+
+
+@api_endpoint
+@require_http_methods(["POST"])
+def siwe_verify(request):
+    body = parse_json(request)
+    session = exchange_siwe_signature(message=body.get("message"), signature=body.get("signature"))
+    user = repository.upsert_user_by_wallet(session["walletAddress"])
     return json_ok({"session": session, "user": user}, status=201)
 
 
@@ -112,10 +123,12 @@ def upsert_profile(request):
     for key in ["walletAddress", "smartWalletAddress"]:
         if body.get(key) and not wallet_matches_auth(request.app_auth, body[key]):
             raise ApiError("wallet_not_authorized", status_code=403)
+    auth_user = repository.get_user_by_wallet(request.app_auth["walletAddress"])
     profile = repository.upsert_profile({
         **body,
-        "email": request.app_auth.get("email") or body.get("email"),
-        "privyUserId": request.app_auth.get("privyUserId") or request.app_auth.get("sub"),
+        "id": body.get("id") or (auth_user or {}).get("id"),
+        "email": (auth_user or {}).get("email", ""),
+        "walletAddress": request.app_auth["walletAddress"],
     })
     return json_ok({"profile": profile}, status=201)
 

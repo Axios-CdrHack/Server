@@ -20,7 +20,7 @@ The frontend API client uses `http://localhost:8001`.
 - `main/settings.py`: loads `django_server/.env` and the repository root `.env`, then configures the SQLite database.
 - `main/urls.py`: wires the full API route table.
 - `main/views.py`: provides shared JSON responses, auth decorators, validation helpers, and the CDR API proxy.
-- `main/auth.py`: exchanges Privy sessions for app JWTs and verifies app JWTs.
+- `main/auth.py`: creates one-time SIWE challenges, verifies wallet signatures, and signs app JWTs.
 - `main/errors.py`: defines typed API errors.
 
 ## App Layout
@@ -31,10 +31,10 @@ django_server/
     settings.py       # Django settings, env loader, installed apps
     urls.py           # API route table
     views.py          # common API wrappers, auth guards, CDR proxy
-    auth.py           # Privy token exchange and app JWT verification
+    auth.py           # SIWE verification and server-signed app JWTs
     constants.py      # chain, contract, pricing, field constants
   users/
-    views.py          # auth exchange, profile, wallet, avatar endpoints
+    views.py          # SIWE auth, profile, wallet, avatar endpoints
     repository.py     # AppUser, education, career persistence
     models.py         # user profile tables
   data/
@@ -65,7 +65,7 @@ Most mutating endpoints use this stack:
 | Group | Endpoints | Purpose |
 | --- | --- | --- |
 | Health | `GET /health` | service health check |
-| Auth/User | `POST /auth/privy/exchange`, `GET/POST /profiles`, `GET /profiles/me`, `POST /users/wallet` | Privy auth exchange, profile CRUD, wallet binding |
+| Auth/User | `GET /auth/siwe/nonce`, `POST /auth/siwe/message`, `POST /auth/siwe/verify`, `GET/POST /profiles`, `GET /profiles/me` | Wallet-only SIWE login and profile CRUD |
 | Fields | `GET /profiles/<id>/fields`, `POST /fields`, `POST /verify/start`, `POST /verify/confirm` | user data field creation and verification |
 | CDR | `POST /uploads/field-ip-metadata`, `POST /cdr/server-deploy`, `GET /cdr/server-deploy/events`, `POST /cdr/toggle` | metadata upload, server wallet CDR deployment, listing toggle |
 | Search | `POST /search/quote`, `GET /search/requests`, `GET /search/requests/<id>`, `POST /search/requests/<id>/extend` | anonymous quote and saved search request flow |
@@ -188,7 +188,7 @@ flowchart TD
 
 | Integration | Code | Role |
 | --- | --- | --- |
-| Privy | `main/auth.py`, `users/views.py` | exchange Privy access token and issue app JWT |
+| RainbowKit/SIWE | `main/auth.py`, `users/views.py` | verify one-time wallet signatures and issue server-signed app JWTs |
 | Object storage | `data/integrations.py` | upload profile images and Story field metadata |
 | Resend/Twilio | `data/integrations.py` | email/mobile verification codes |
 | Story Protocol | `front/scripts/server_deploy_field_cdr.mjs`, `front/scripts/server_mint_license_tokens.mjs` | IP registration, license config, license token minting |

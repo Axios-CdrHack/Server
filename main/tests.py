@@ -4,16 +4,14 @@ import os
 from io import StringIO
 from unittest.mock import patch
 
-import jwt
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 from django.apps import apps as django_apps
 from django.core.management import CommandError, call_command
 from django.db import connection
 from django.test import Client, TestCase
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
-from . import auth as auth_module
-from .auth import get_privy_user, sign_app_jwt, verify_privy_access_token
+from .auth import sign_app_jwt
 from data import repository
 from data.models import AppDataField, AppOrder, AppOrderItem, AppOrderSellerPayout, AppQuote, AppSearchDocument
 from data.integrations import hex_with_0x
@@ -24,7 +22,7 @@ from users.models import AppCareer, AppEducation, AppUser
 
 class ApiSmokeTests(TestCase):
     def setUp(self):
-        os.environ["PRIVY_APP_SECRET"] = "test-secret"
+        os.environ["APP_AUTH_SECRET"] = "test-app-auth-secret-that-is-at-least-32-characters"
         self.client = Client(HTTP_ORIGIN="http://localhost:3000")
         self.create_profiles()
 
@@ -74,11 +72,10 @@ class ApiSmokeTests(TestCase):
     def auth_headers(self):
         token = sign_app_jwt(
             {
-                "privyUserId": "privy-test",
                 "sessionId": "session-test",
                 "expiresAtSeconds": 9999999999,
-                "email": "jane.pm@example.com",
                 "walletAddress": "0x1111111111111111111111111111111111111111",
+                "chainId": 1315,
             }
         )["token"]
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"}
@@ -406,76 +403,76 @@ class ApiSmokeTests(TestCase):
         self.assertEqual(mock_post.call_args.kwargs["data"]["From"], "+15550000000")
         self.assertIn("Your AXIOS verification code is", mock_post.call_args.kwargs["data"]["Body"])
 
-    @patch("main.auth.requests.get")
-    def test_privy_user_lookup_sends_app_id_header(self, mock_get):
-        os.environ["PRIVY_APP_ID"] = "test-privy-app-id"
-        os.environ["PRIVY_APP_SECRET"] = "test-privy-secret"
-        mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {"id": "did:privy:test", "linked_accounts": []}
+    def test_siwe_wallet_login_issues_server_session_and_is_single_use(self):
+        account = Account.create()
+        nonce_response = self.client.get("/auth/siwe/nonce")
+        self.assertEqual(nonce_response.status_code, 200)
 
-        get_privy_user("did:privy:test")
-
-        headers = mock_get.call_args.kwargs["headers"]
-        self.assertEqual(headers["privy-app-id"], "test-privy-app-id")
-
-    @patch("main.auth.get_privy_user")
-    @patch("main.auth.verify_privy_access_token")
-    def test_privy_exchange_requires_wallet_login(self, mock_verify, mock_user):
-        mock_verify.return_value = {
-            "user_id": "did:privy:email-only",
-            "session_id": "session-test",
-            "expiration": 9999999999,
-        }
-        mock_user.return_value = {
-            "id": "did:privy:email-only",
-            "linked_accounts": [{"type": "email", "address": "email-only@example.com"}],
-        }
-
-        response = self.client.post(
-            "/auth/privy/exchange",
-            {"privyAccessToken": "privy-access-token-for-test"},
+        message_response = self.client.post(
+            "/auth/siwe/message",
+            {"nonce": nonce_response.json()["nonce"], "address": account.address, "chainId": 1315},
             content_type="application/json",
         )
+        self.assertEqual(message_response.status_code, 200)
+        message = message_response.json()["message"]
+        signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
 
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["error"], "wallet_login_required")
-
-    @patch("main.auth.requests.get")
-    def test_privy_access_token_uses_app_verification_key(self, mock_get):
-        auth_module._PRIVY_VERIFICATION_KEY_CACHE.clear()
-        os.environ["PRIVY_APP_ID"] = "test-privy-app-id"
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        private_pem = private_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
+        verify_response = self.client.post(
+            "/auth/siwe/verify",
+            {"message": message, "signature": signature},
+            content_type="application/json",
         )
-        public_pem = private_key.public_key().public_bytes(
-            serialization.Encoding.PEM,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        ).decode()
-        token = jwt.encode(
-            {
-                "sid": "session-test",
-                "sub": "did:privy:test",
-                "iss": "privy.io",
-                "aud": "test-privy-app-id",
-                "iat": 1,
-                "exp": 9999999999,
-            },
-            private_pem,
-            algorithm="ES256",
+        self.assertEqual(verify_response.status_code, 201)
+        self.assertEqual(verify_response.json()["session"]["walletAddress"].lower(), account.address.lower())
+        self.assertTrue(verify_response.json()["session"]["token"])
+        self.assertTrue(AppUser.objects.filter(wallet_address__iexact=account.address).exists())
+
+        replay_response = self.client.post(
+            "/auth/siwe/verify",
+            {"message": message, "signature": signature},
+            content_type="application/json",
         )
-        mock_get.return_value.status_code = 200
-        mock_get.return_value.json.return_value = {"verification_key": "".join(public_pem.splitlines())}
+        self.assertEqual(replay_response.status_code, 401)
+        self.assertEqual(replay_response.json()["error"], "invalid_auth_token")
 
-        verified = verify_privy_access_token(token)
+    def test_siwe_rejects_wrong_chain_and_disabled_email_login(self):
+        account = Account.create()
+        nonce = self.client.get("/auth/siwe/nonce").json()["nonce"]
+        wrong_chain = self.client.post(
+            "/auth/siwe/message",
+            {"nonce": nonce, "address": account.address, "chainId": 1},
+            content_type="application/json",
+        )
+        self.assertEqual(wrong_chain.status_code, 400)
+        self.assertEqual(wrong_chain.json()["error"], "siwe_chain_not_supported")
+        self.assertEqual(self.client.post("/users/email-session", {}, content_type="application/json").status_code, 404)
 
-        self.assertEqual(verified["user_id"], "did:privy:test")
-        self.assertEqual(verified["session_id"], "session-test")
-        self.assertEqual(verified["app_id"], "test-privy-app-id")
-        self.assertEqual(mock_get.call_args.args[0], "https://auth.privy.io/api/v1/apps/test-privy-app-id")
-        self.assertEqual(mock_get.call_args.kwargs["headers"]["privy-app-id"], "test-privy-app-id")
+    def test_siwe_rejects_a_different_wallet_signature_without_consuming_nonce(self):
+        account = Account.create()
+        attacker = Account.create()
+        nonce = self.client.get("/auth/siwe/nonce").json()["nonce"]
+        message = self.client.post(
+            "/auth/siwe/message",
+            {"nonce": nonce, "address": account.address, "chainId": 1315},
+            content_type="application/json",
+        ).json()["message"]
+        self.assertIn("localhost:3000 wants you to sign in", message)
+
+        attacker_signature = Account.sign_message(encode_defunct(text=message), attacker.key).signature.hex()
+        rejected = self.client.post(
+            "/auth/siwe/verify",
+            {"message": message, "signature": attacker_signature},
+            content_type="application/json",
+        )
+        self.assertEqual(rejected.status_code, 401)
+
+        owner_signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
+        accepted = self.client.post(
+            "/auth/siwe/verify",
+            {"message": message, "signature": owner_signature},
+            content_type="application/json",
+        )
+        self.assertEqual(accepted.status_code, 201)
 
 
 class BulkSearchCdrCommandTests(TestCase):

@@ -565,6 +565,12 @@ def get_user_by_email(email):
     return user_to_dict(user) if user else None
 
 
+def get_user_by_wallet(wallet_address):
+    normalized = wallet_address.strip().lower()
+    user = AppUser.objects.filter(wallet_address__iexact=normalized).order_by("-has_profile", "-updated_at").first()
+    return user_to_dict(user) if user else None
+
+
 def save_user_dict(user, has_profile=None):
     existing = AppUser.objects.filter(id=user["id"]).first()
     defaults = profile_defaults(
@@ -588,6 +594,33 @@ def upsert_user_by_email(email):
     normalized = email.strip().lower()
     existing = get_user_by_email(normalized)
     user = create_auth_user_stub(normalized, existing)
+    return user_account(persist_user(user))
+
+
+def upsert_user_by_wallet(wallet_address):
+    normalized_wallet = wallet_address.strip()
+    existing = get_user_by_wallet(normalized_wallet)
+    timestamp = now_iso()
+    compact_wallet = f"{normalized_wallet[:6]}…{normalized_wallet[-4:]}"
+    user = {
+        "id": (existing or {}).get("id") or f"user-{nanoid(10)}",
+        "privyUserId": (existing or {}).get("privyUserId"),
+        "email": (existing or {}).get("email", ""),
+        "walletAddress": normalized_wallet,
+        "smartWalletAddress": (existing or {}).get("smartWalletAddress"),
+        "name": (existing or {}).get("name") or compact_wallet,
+        "age": (existing or {}).get("age") or 0,
+        "occupation": (existing or {}).get("occupation") or "",
+        "gender": (existing or {}).get("gender") or "",
+        "country": normalize_country((existing or {}).get("country")),
+        "residence": (existing or {}).get("residence") or "",
+        "displayName": (existing or {}).get("displayName") or compact_wallet,
+        "publicSlug": (existing or {}).get("publicSlug") or f"wallet-{normalized_wallet[2:10].lower()}-{nanoid(6).lower()}",
+        "avatarUrl": (existing or {}).get("avatarUrl"),
+        "payoutAddress": (existing or {}).get("payoutAddress") or normalized_wallet,
+        "createdAt": (existing or {}).get("createdAt") or timestamp,
+        "updatedAt": timestamp,
+    }
     return user_account(persist_user(user))
 
 

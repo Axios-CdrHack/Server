@@ -7,12 +7,15 @@ from users import views as user_views
 
 urlpatterns = [
     path("health", common_views.health),
-    path("auth/privy/exchange", user_views.privy_exchange),
+    path("auth/siwe/nonce", user_views.siwe_nonce),
+    path("auth/siwe/message", user_views.siwe_message),
+    path("auth/siwe/verify", user_views.siwe_verify),
     re_path(r"^cdr-api/(?P<path>.*)$", common_views.cdr_api_proxy),
     path("profiles", user_views.profiles_endpoint),
     path("profiles/me", user_views.my_profile),
-    path("users/email-session", user_views.email_session),
-    path("users/wallet", user_views.wallet_user),
+    # Email/social login routes are intentionally disabled. SIWE wallet auth is the only account entry path.
+    # path("users/email-session", user_views.email_session),
+    # path("users/wallet", user_views.wallet_user),
     path("profiles/<str:profile_id>/fields", data_views.profile_fields),
     path("uploads/avatar", user_views.upload_avatar),
     path("uploads/field-ip-metadata", onchain_views.field_ip_metadata),
